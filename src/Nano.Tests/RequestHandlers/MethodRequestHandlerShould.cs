@@ -680,8 +680,11 @@ namespace Nano.Tests.RequestHandlers
                 server.NanoConfiguration.AddMethods<ETagTestsApi>();
 
                 // Act
-                var response = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                var eTag = response.GetResponseHeader( "ETag" );
+                string eTag;
+                using ( var response = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" ) )
+                {
+                    eTag = response.GetResponseHeader("ETag");
+                }
 
                 // Visual Assertion
                 Trace.WriteLine( "ETag Header Value: " + eTag );
@@ -692,44 +695,83 @@ namespace Nano.Tests.RequestHandlers
         }
 
         [Test]
+        public void Return_A_Quoted_ETag_Header_When_An_Http_200_Response_Is_Returned()
+        {
+            using (var server = NanoTestServer.Start())
+            {
+                // Arrange
+                server.NanoConfiguration.AddMethods<ETagTestsApi>();
+
+                // Act
+                string eTag;
+                using (var response = HttpHelper.GetHttpWebResponse(server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1"))
+                {
+                    eTag = response.GetResponseHeader("ETag");
+                }
+
+                // Visual Assertion
+                Trace.WriteLine("ETag Header Value: " + eTag);
+
+                // Assert
+                Assert.That( eTag.StartsWith( "\"") && eTag.EndsWith( "\"" ) );
+            }
+        }
+
+        [Test]
         public void Return_Not_Modified_Http_Status_Code_304_When_Request_ETag_Matches_File_ETag()
         {
             using( var server = NanoTestServer.Start() )
             {
                 // Arrange
                 server.NanoConfiguration.AddMethods<ETagTestsApi>();
-                var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                var initialETag = initialResponse.GetResponseHeader( "ETag" );
+
+                string initialETag;
+                using ( var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" ) )
+                {
+                    initialETag = initialResponse.GetResponseHeader("ETag");
+                }
+
                 var request = HttpHelper.GetHttpWebRequest( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
                 request.Headers["If-None-Match"] = initialETag;
 
                 // Act
-                var response = request.GetHttpWebResponse();
-                var responseCode = response.StatusCode;
+                HttpStatusCode responseCode;
+                using ( var response = request.GetHttpWebResponse() )
+                {
+                    responseCode = response.StatusCode;
+                }
 
                 // Visual Assertion
-                Trace.WriteLine( "HTTP Status Code: " + responseCode );
+                Trace.WriteLine("HTTP Status Code: " + responseCode);
 
                 // Assert
-                Assert.That( responseCode == HttpStatusCode.NotModified );
+                Assert.That(responseCode == HttpStatusCode.NotModified);
             }
         }
 
         [Test]
         public void Return_Matching_ETag_When_Server_Returns_Not_Modified()
         {
-            using( var server = NanoTestServer.Start() )
+            using ( var server = NanoTestServer.Start() )
             {
                 // Arrange
                 server.NanoConfiguration.AddMethods<ETagTestsApi>();
-                var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                var initialETag = initialResponse.GetResponseHeader( "ETag" );
+
+                string initialETag;
+                using ( var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" ) )
+                {
+                    initialETag = initialResponse.GetResponseHeader("ETag");
+                }
+
                 var request = HttpHelper.GetHttpWebRequest( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                request.Headers["If-None-Match"] = initialETag;
+                request.Headers[ "If-None-Match" ] = initialETag;
 
                 // Act
-                var response = request.GetHttpWebResponse();
-                var eTag = response.GetResponseHeader( "ETag" );
+                string eTag;
+                using ( var response = request.GetHttpWebResponse() )
+                {
+                    eTag = response.GetResponseHeader( "ETag" );
+                }
 
                 // Visual Assertion
                 Trace.WriteLine( "ETag Header Value: " + eTag );
@@ -746,14 +788,22 @@ namespace Nano.Tests.RequestHandlers
             {
                 // Arrange
                 server.NanoConfiguration.AddMethods<ETagTestsApi>();
-                var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                var initialETag = initialResponse.GetResponseHeader( "ETag" );
+
+                string initialETag;
+                using ( var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" ) )
+                {
+                    initialETag = initialResponse.GetResponseHeader("ETag");
+                }
+                
                 var request = HttpHelper.GetHttpWebRequest( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=2" );
                 request.Headers["If-None-Match"] = initialETag;
 
                 // Act
-                var response = request.GetHttpWebResponse();
-                var eTag = response.GetResponseHeader( "ETag" );
+                string eTag;
+                using ( var response = request.GetHttpWebResponse() )
+                {
+                    eTag = response.GetResponseHeader( "ETag" );
+                }
 
                 // Visual Assertion
                 Trace.WriteLine( "1st ETag Header Value: " + initialETag );
@@ -771,15 +821,23 @@ namespace Nano.Tests.RequestHandlers
             {
                 // Arrange
                 server.NanoConfiguration.AddMethods<ETagTestsApi>();
-                var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
-                Trace.WriteLine( "Initial Response Length: " + initialResponse.GetResponseString().Length );
-                var initialETag = initialResponse.GetResponseHeader( "ETag" );
+
+                string initialETag;
+                using ( var initialResponse = HttpHelper.GetHttpWebResponse( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" ) )
+                {
+                    Trace.WriteLine("Initial Response Length: " + initialResponse.GetResponseString().Length);
+                    initialETag = initialResponse.GetResponseHeader("ETag");
+                }
+
                 var request = HttpHelper.GetHttpWebRequest( server.GetUrl() + "/api/ETagTestsApi/GetPerson?id=1" );
                 request.Headers["If-None-Match"] = initialETag;
 
                 // Act
-                var response = request.GetHttpWebResponse();
-                var responseLength = response.GetResponseString().Length;
+                int responseLength;
+                using ( var response = request.GetHttpWebResponse() )
+                {
+                    responseLength = response.GetResponseString().Length;
+                }
 
                 // Visual Assertion
                 Trace.WriteLine( "Not Modified Response Length: " + responseLength );

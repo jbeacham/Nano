@@ -1,5 +1,5 @@
-﻿/*
-    Nano v0.12.0
+/*
+    Nano v0.14.99
     
     Nano is a .NET cross-platform micro web framework for building web-based HTTP services and websites.
 
@@ -41,9 +41,11 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
@@ -90,22 +92,31 @@ namespace Nano.Web.Core
         /// <summary>The optional request handler to invoke when a request was not handled by any other request or event handler.</summary>
         public IRequestHandler UnhandledRequestHandler;
 
-        /// <summary>The background tasks</summary>
+        /// <summary>The background tasks.</summary>
         public IList<BackgroundTask> BackgroundTasks = new List<BackgroundTask>();
 
         /// <summary>The serialization service used to serialize/deserialize requests and responses.</summary>
-        public ISerializationService SerializationService;
+        public ISerializationService SerializationService = new JsonNetSerializer();
 
         /// <summary>Gets the default method url path. Defaulted to: '/api/' + type.Name</summary>
         public Func<Type, string> GetDefaultMethodUrlPath = type => "/api/" + type.Name;
 
+        /// <summary>Determines whether errors are logged to the operating system event log.</summary>
+        public bool LogErrorsToEventLog = true;
+
+        /// <summary>Application name.</summary>
+        public string ApplicationName = AppDomain.CurrentDomain.FriendlyName;
+
+        /// <summary>The limit on the number of query string variables, form fields, or multipart sections in a request. Default is 1,000. The reason to limit the number of parameters processed by the server is detailed in the following security notice regarding a particular 'Collisions in HashTable' denial-of-service (DoS) attack vector: http://www.ocert.org/advisories/ocert-2011-003.html </summary>
+        public int RequestParameterLimit = 1000;
+
         /// <summary>Initializes a new instance of the <see cref="NanoConfiguration" /> class.</summary>
-        /// <param name="serializationService">The optional serialization service used to serialize/deserialize requests and responses.</param>
-        public NanoConfiguration( ISerializationService serializationService = null )
+        public NanoConfiguration()
         {
-            SerializationService = serializationService ?? new JsonNetSerializer();
             RequestHandlers.Add( new MetadataRequestHandler( "/metadata/GetNanoMetadata", DefaultEventHandler ) );
             this.EnableCorrelationId();
+            this.DisableKeepAlive();
+            this.EnableElapsedMillisecondsResponseHeader();
         }
 
         /// <summary>Adds all public static methods in the given type.</summary>
@@ -123,8 +134,9 @@ namespace Nano.Web.Core
 
             foreach( MethodInfo methodInfo in methods )
             {
-                string methodUrlPath = string.Format( "/{0}/{1}", urlPath, methodInfo.Name ).ToLower();
-                var requestHandler = new MethodRequestHandler( methodUrlPath, eventHandler ?? DefaultEventHandler, methodInfo ) { MetadataProvider = metadataProvider ?? DefaultMethodRequestHandlerMetadataProvider };
+                string caseSensitiveUrlPath = string.Format( "/{0}/{1}", urlPath, methodInfo.Name );
+                string methodUrlPath = caseSensitiveUrlPath.ToLower();
+                var requestHandler = new MethodRequestHandler( methodUrlPath, eventHandler ?? DefaultEventHandler, methodInfo ) { MetadataProvider = metadataProvider ?? DefaultMethodRequestHandlerMetadataProvider, CaseSensitiveUrlPath = caseSensitiveUrlPath };
                 RequestHandlers.Add( requestHandler );
                 handlers.Add( requestHandler );
             }
@@ -214,6 +226,9 @@ namespace Nano.Web.Core
     /// <summary>The context of the current web request.</summary>
     public class NanoContext : IDisposable
     {
+        /// <summary>Correlation / request identifier.</summary>
+        public string CorrelationId;
+
         /// <summary>The current user.</summary>
         public IUserIdentity CurrentUser;
 
@@ -242,42 +257,74 @@ namespace Nano.Web.Core
         /// <summary>The <see cref="IRequestHandler" /> for this context.</summary>
         public IRequestHandler RequestHandler;
 
+        /// <summary>The initial timestamp of the current HTTP request.</summary>
+        public DateTime RequestTimestamp;
+
         /// <summary>The outgoing response.</summary>
         public NanoResponse Response;
 
         /// <summary>The root folder path.</summary>
         /// <value>The root folder path.</value>
         public string RootFolderPath;
-        
+
+        /// <summary>
+        /// Flag to indicate if a dispose has been called already
+        /// </summary>
+        private bool _disposed;
+
         /// <summary>Initializes a new instance of the <see cref="NanoContext" /> class.</summary>
         /// <param name="nanoRequest">The nano request.</param>
         /// <param name="nanoResponse">The nano response.</param>
         /// <param name="nanoConfiguration">The nano configuration.</param>
-        public NanoContext( NanoRequest nanoRequest, NanoResponse nanoResponse, NanoConfiguration nanoConfiguration )
+        /// <param name="requestTimestamp">The initial timestamp of the current HTTP request.</param>
+        public NanoContext( NanoRequest nanoRequest, NanoResponse nanoResponse, NanoConfiguration nanoConfiguration, DateTime requestTimestamp )
         {
             nanoRequest.NanoContext = this;
             Request = nanoRequest;
-
             nanoResponse.NanoContext = this;
             Response = nanoResponse;
-
             NanoConfiguration = nanoConfiguration;
+            RequestTimestamp = requestTimestamp;
         }
 
         /// <summary>Disposes any disposable items in the <see cref="Items" /> dictionary.</summary>
         public void Dispose()
         {
-            foreach( IDisposable disposableItem in Items.Values.OfType<IDisposable>() )
-                disposableItem.Dispose();
+            Dispose( true );
+            GC.SuppressFinalize( this );
+        }
 
-            Items.Clear();
+        /// <summary>
+        /// Disposes any disposable items in the <see cref="Items" /> dictionary.
+        /// </summary>
+        /// <param name="disposing"></param>
+        protected virtual void Dispose( bool disposing )
+        {
+            if ( _disposed )
+                return;
+
+            if ( disposing )
+            {
+                // Free any other managed objects here. 
+                foreach ( IDisposable disposableItem in Items.Values.OfType<IDisposable>() )
+                    disposableItem.Dispose();
+
+                Items.Clear();
+            }
+
+            // Free any unmanaged objects here. 
+            _disposed = true;
         }
     }
 
     /// <summary>Holds properties associated with the current HTTP request.</summary>
     public class NanoRequest
     {
-        private readonly Func<Stream> _requestBodyAccessor;
+        /// <summary>IP address of the client.</summary>
+        public string ClientIpAddress;
+
+        /// <summary>The files sent by the client in a multipart message.</summary>
+        public IList<HttpFile> Files;
 
         /// <summary>The HTTP form body parameters sent by the client.</summary>
         public NameValueCollection FormBodyParameters;
@@ -291,29 +338,35 @@ namespace Nano.Web.Core
         /// <summary>The Nano context.</summary>
         public NanoContext NanoContext;
 
-        /// <summary>The HTTP query string parameters sent by the client..</summary>
+        /// <summary>The HTTP query string parameters sent by the client.</summary>
         public NameValueCollection QueryStringParameters;
 
         /// <summary>Full URL being requested.</summary>
         public Url Url;
-        
+
         /// <summary>Initializes a new instance of the <see cref="NanoRequest" /> class.</summary>
         /// <param name="httpMethod">The HTTP method.</param>
         /// <param name="url">The URL being requested.</param>
-        /// <param name="requestBodyAccessor">A function that returns the request body stream.</param>
-        public NanoRequest( string httpMethod, Url url, Func<Stream> requestBodyAccessor )
+        /// <param name="requestStream">Request stream body.</param>
+        /// <param name="queryStringParameters">The HTTP query string parameters sent by the client.</param>
+        /// <param name="formBodyParameters">The HTTP form body parameters sent by the client.</param>
+        /// <param name="headerParameters">The HTTP header parameters sent by the client.</param>
+        /// <param name="files">The files sent by the client in a multipart message.</param>
+        /// <param name="clientIpAddress">IP address of the client.</param>
+        public NanoRequest( string httpMethod, Url url, RequestStream requestStream, NameValueCollection queryStringParameters, NameValueCollection formBodyParameters, NameValueCollection headerParameters, IList<HttpFile> files, string clientIpAddress )
         {
             HttpMethod = httpMethod;
             Url = url;
-            _requestBodyAccessor = requestBodyAccessor;
+            RequestBody = requestStream;
+            QueryStringParameters = queryStringParameters ?? new NameValueCollection();
+            FormBodyParameters = formBodyParameters ?? new NameValueCollection();
+            HeaderParameters = headerParameters ?? new NameValueCollection();
+            Files = files ?? new List<HttpFile>();
+            ClientIpAddress = clientIpAddress;
         }
 
-        /// <summary>Gets the request body.</summary>
-        /// <value>The request body.</value>
-        public Stream RequestBody
-        {
-            get { return _requestBodyAccessor(); }
-        }
+        /// <summary>Gets a <see cref="RequestStream"/> that can be used to read the incoming HTTP body</summary>
+        public RequestStream RequestBody;
     }
 
     /// <summary>Holds properties associated with the current HTTP response.</summary>
@@ -398,29 +451,29 @@ namespace Nano.Web.Core
         }
 
         /// <summary>The domain to restrict the cookie to</summary>
-        public string Domain { get; set; }
+        public string Domain;
 
         /// <summary>When the cookie should expire</summary>
         /// <value>
         /// A <see cref="DateTime" /> instance containing the date and time when the cookie should expire; otherwise
         /// <see langword="null" /> if it should expire at the end of the session.
         /// </value>
-        public DateTime? Expires { get; set; }
+        public DateTime? Expires;
 
         /// <summary>The name of the cookie</summary>
-        public string Name { get; private set; }
-        
+        public string Name;
+
         /// <summary>The path to restrict the cookie to</summary>
-        public string Path { get; set; }
+        public string Path;
 
         /// <summary>The value of the cookie</summary>
-        public string Value { get; private set; }
-        
+        public string Value;
+
         /// <summary>Whether a cookie is accessible by client-side script.</summary>
-        public bool HttpOnly { get; private set; }
+        public bool HttpOnly;
 
         /// <summary>Whether the cookie is secure ( HTTPS only )</summary>
-        public bool Secure { get; private set; }
+        public bool Secure;
 
         /// <summary>Returns a <see cref="System.String" /> that represents this instance as a valid Set-Cookie header value.</summary>
         /// <returns>A <see cref="System.String" /> that represents this instance as a valid Set-Cookie header value.</returns>
@@ -445,6 +498,456 @@ namespace Nano.Web.Core
                 sb.Append( "; HttpOnly" );
 
             return sb.ToString();
+        }
+    }
+
+    /// <summary>Represents a file that was captured in a HTTP multipart/form-data request</summary>
+    public class HttpFile
+    {
+        /// <summary>Initializes a new instance of an <see cref="HttpFile"/>.</summary>
+        /// <paramref name="contentType">The content type of the file.</paramref>
+        /// <paramref name="fileName">The name of the file.</paramref>
+        /// <paramref name="value">The content of the file.</paramref>
+        /// <paramref name="name">The name of the field that uploaded the file.</paramref>
+        public HttpFile(string contentType, string fileName, Stream value, string name)
+        {
+            ContentType = contentType;
+            FileName = fileName;
+            Value = value;
+            Name = name;
+        }
+
+        /// <summary>The type of the content.</summary>
+        public readonly string ContentType;
+
+        /// <summary>The name of the file.</summary>
+        public readonly string FileName;
+
+        /// <summary>The form element name of the file.</summary>
+        public readonly string Name;
+
+        /// <summary>A <see cref="Stream"/> containing the contents of the file.</summary>
+        /// <remarks>This is a <see cref="Multipart.HttpMultipartSubStream"/> instance that sits ontop of the request stream.</remarks>
+        public readonly Stream Value;
+    }
+
+    /// <summary>A <see cref="Stream"/> decorator that can handle moving the stream out from memory and on to disk when the contents reaches a certain length.</summary>
+    public class RequestStream : Stream
+    {
+        /// <summary>The number of bytes that indicate the input-stream buffering threshold before the data is buffered transparently onto disk. The default is 80 kilobytes.</summary>
+        public static long RequestLengthDiskThreshold = 81920;
+
+        private bool _disableStreamSwitching;
+        private readonly long _thresholdLength;
+        private bool _isSafeToDisposeStream;
+        private Stream _stream;
+
+        /// <summary>Buffer size for copy operations</summary>
+        private const int BufferSize = 4096;
+
+        /// <summary>Initializes a new instance of the <see cref="RequestStream"/> class.</summary>
+        /// <param name="stream">The <see cref="Stream"/> that should be handled by the request stream.</param>
+        /// <param name="expectedLength">The expected length of the contents in the stream.</param>
+        /// <param name="thresholdLength">The content length that will trigger the stream to be moved out of memory.</param>
+        /// <param name="disableStreamSwitching">If set to <see langword="true"/> the stream will never explicitly be moved to disk.</param>
+        public RequestStream( Stream stream, long expectedLength, long thresholdLength, bool disableStreamSwitching )
+        {
+            _thresholdLength = thresholdLength;
+            _disableStreamSwitching = disableStreamSwitching;
+            _stream = stream ?? CreateDefaultMemoryStream( expectedLength );
+
+            ThrowExceptionIfCtorParametersWereInvalid( _stream, expectedLength, _thresholdLength );
+
+            if ( !MoveStreamOutOfMemoryIfExpectedLengthExceedSwitchLength( expectedLength ) )
+                MoveStreamOutOfMemoryIfContentsLengthExceedThresholdAndSwitchingIsEnabled();
+
+            if ( !_stream.CanSeek )
+            {
+                var task = MoveToWritableStream();
+                task.Wait();
+
+                if ( task.IsFaulted )
+                    throw new InvalidOperationException( "Unable to copy stream", task.Exception );
+            }
+
+            _stream.Position = 0;
+        }
+
+        private Task<object> MoveToWritableStream()
+        {
+            var tcs = new TaskCompletionSource<object>();
+            var sourceStream = _stream;
+            _stream = new MemoryStream( BufferSize );
+
+            CopyTo( sourceStream, this, ( source, destination, ex ) =>
+            {
+                if ( ex != null )
+                    tcs.SetException( ex );
+                else
+                    tcs.SetResult( null );
+            } );
+
+            return tcs.Task;
+        }
+
+        /// <summary>Copies the contents between two <see cref="Stream"/> instances in an async fashion.</summary>
+        /// <param name="source">The source stream to copy from.</param>
+        /// <param name="destination">The destination stream to copy to.</param>
+        /// <param name="onComplete">Delegate that should be invoked when the operation has completed. Will pass the source, destination and exception (if one was thrown) to the function. Can pass in <see langword="null" />.</param>
+        public static void CopyTo( Stream source, Stream destination, Action<Stream, Stream, Exception> onComplete )
+        {
+            var buffer = new byte[BufferSize];
+
+            Action<Exception> done = e =>
+            {
+                if ( onComplete != null )
+                    onComplete.Invoke( source, destination, e );
+            };
+
+            AsyncCallback rc = null;
+
+            rc = readResult =>
+            {
+                try
+                {
+                    var read = source.EndRead( readResult );
+
+                    if ( read <= 0 )
+                    {
+                        done.Invoke( null );
+                        return;
+                    }
+
+                    destination.BeginWrite( buffer, 0, read, writeResult =>
+                    {
+                        try
+                        {
+                            destination.EndWrite( writeResult );
+                            source.BeginRead( buffer, 0, buffer.Length, rc, null );
+                        }
+                        catch ( Exception ex )
+                        {
+                            done.Invoke( ex );
+                        }
+
+                    }, null );
+                }
+                catch ( Exception ex )
+                {
+                    done.Invoke( ex );
+                }
+            };
+
+            source.BeginRead( buffer, 0, buffer.Length, rc, null );
+        }
+
+        /// <summary>Gets a value indicating whether the current stream supports reading.</summary>
+        /// <returns>Always returns <see langword="true"/>.</returns>
+        public override bool CanRead
+        {
+            get { return true; }
+        }
+
+        /// <summary>Gets a value indicating whether the current stream supports seeking.</summary>
+        /// <returns>Always returns <see langword="true"/>.</returns>
+        public override bool CanSeek
+        {
+            get { return _stream.CanSeek; }
+        }
+
+        /// <summary>Gets a value that determines whether the current stream can time out.</summary>
+        /// <returns>Always returns <see langword="false"/>.</returns>
+        public override bool CanTimeout
+        {
+            get { return false; }
+        }
+
+        /// <summary>Gets a value indicating whether the current stream supports writing.</summary>
+        /// <returns>Always returns <see langword="true"/>.</returns>
+        public override bool CanWrite
+        {
+            get { return true; }
+        }
+
+        /// <summary>Gets the length in bytes of the stream.</summary>
+        /// <returns>A long value representing the length of the stream in bytes.</returns>
+        public override long Length
+        {
+            get { return _stream.Length; }
+        }
+
+        /// <summary>Gets a value indicating whether the current stream is stored in memory.</summary>
+        /// <value><see langword="true"/> if the stream is stored in memory; otherwise, <see langword="false"/>.</value>
+        /// <remarks>The stream is moved to disk when either the length of the contents or expected content length exceeds the threshold specified in the constructor.</remarks>
+        public bool IsInMemory
+        {
+            get { return !( _stream.GetType() == typeof ( FileStream ) ); }
+        }
+
+        /// <summary>
+        /// Gets or sets the position within the current stream.
+        /// </summary>
+        /// <returns>The current position within the stream.</returns>
+        public override long Position
+        {
+            get { return _stream.Position; }
+            set
+            {
+                if ( value < 0 )
+                    throw new InvalidOperationException( "The position of the stream cannot be set to less than zero." );
+
+                if ( value > Length )
+                    throw new InvalidOperationException( "The position of the stream cannot exceed the length of the stream." );
+
+                _stream.Position = value;
+            }
+        }
+
+        /// <summary>
+        /// Begins an asynchronous read operation.
+        /// </summary>
+        /// <returns>An <see cref="T:System.IAsyncResult"/> that represents the asynchronous read, which could still be pending.</returns>
+        /// <param name="buffer">The buffer to read the data into. </param>
+        /// <param name="offset">The byte offset in <paramref name="buffer"/> at which to begin writing data read from the stream. </param>
+        /// <param name="count">The maximum number of bytes to read. </param>
+        /// <param name="callback">An optional asynchronous callback, to be called when the read is complete. </param>
+        /// <param name="state">A user-provided object that distinguishes this particular asynchronous read request from other requests. </param>
+        public override IAsyncResult BeginRead( byte[] buffer, int offset, int count, AsyncCallback callback, object state )
+        {
+            return _stream.BeginRead( buffer, offset, count, callback, state );
+        }
+
+        /// <summary>
+        /// Begins an asynchronous write operation.
+        /// </summary>
+        /// <returns>An <see cref="IAsyncResult"/> that represents the asynchronous write, which could still be pending.</returns>
+        /// <param name="buffer">The buffer to write data from. </param>
+        /// <param name="offset">The byte offset in <paramref name="buffer"/> from which to begin writing. </param>
+        /// <param name="count">The maximum number of bytes to write. </param>
+        /// <param name="callback">An optional asynchronous callback, to be called when the write is complete. </param>
+        /// <param name="state">A user-provided object that distinguishes this particular asynchronous write request from other requests.</param>
+        public override IAsyncResult BeginWrite( byte[] buffer, int offset, int count, AsyncCallback callback, object state )
+        {
+            return _stream.BeginWrite( buffer, offset, count, callback, state );
+        }
+
+        /// <summary>Disposes of the stream and if the stream was written to disk deletes the temporary file on disk.</summary>
+        /// <param name="disposing"></param>
+        protected override void Dispose( bool disposing )
+        {
+            if ( _isSafeToDisposeStream )
+            {
+                ( ( IDisposable ) _stream ).Dispose();
+
+                var fileStream = _stream as FileStream;
+                if ( fileStream != null )
+                    DeleteTemporaryFile( fileStream.Name );
+            }
+
+            base.Dispose( disposing );
+        }
+
+        /// <summary>Waits for the pending asynchronous read to complete.</summary>
+        /// <returns>The number of bytes read from the stream, between zero (0) and the number of bytes you requested. Streams return zero (0) only at the end of the stream, otherwise, they should block until at least one byte is available.</returns>
+        /// <param name="asyncResult">The reference to the pending asynchronous request to finish. </param>
+        public override int EndRead( IAsyncResult asyncResult )
+        {
+            return _stream.EndRead( asyncResult );
+        }
+
+        /// <summary>Ends an asynchronous write operation.</summary>
+        /// <param name="asyncResult">A reference to the outstanding asynchronous I/O request. </param>
+        public override void EndWrite( IAsyncResult asyncResult )
+        {
+            _stream.EndWrite( asyncResult );
+            ShiftStreamToFileStreamIfNecessary();
+        }
+
+        /// <summary>
+        /// Clears all buffers for this stream and causes any buffered data to be written to the underlying device.
+        /// </summary>
+        public override void Flush()
+        {
+            _stream.Flush();
+        }
+
+        private static long GetExpectedRequestLength(string contentLengthHeaderValue)
+        {
+            if (contentLengthHeaderValue == null)
+                return 0;
+
+            long contentLength;
+            return !long.TryParse(contentLengthHeaderValue, NumberStyles.Any, CultureInfo.InvariantCulture, out contentLength) ? 0 : contentLength;
+        }
+
+        /// <summary>Initializes a new instance of the <see cref="RequestStream"/> class.</summary>
+        /// <param name="stream">The <see cref="Stream"/> that should be handled by the request stream.</param>
+        /// <param name="contentLength">Content-Length header value.</param>
+        /// <returns><see cref="RequestStream"/> instance.</returns>
+        public static RequestStream FromStream(Stream stream, string contentLength)
+        {
+            long expectedLength = GetExpectedRequestLength( contentLength );
+            return FromStream(stream, expectedLength, RequestLengthDiskThreshold, false);
+        }
+
+        /// <summary>Initializes a new instance of the <see cref="RequestStream"/> class.</summary>
+        /// <param name="stream">The <see cref="Stream"/> that should be handled by the request stream.</param>
+        /// <param name="expectedLength">The expected length of the contents in the stream.</param>
+        /// <param name="thresholdLength">The content length that will trigger the stream to be moved out of memory.</param>
+        /// <param name="disableStreamSwitching">If set to <see langword="true"/> the stream will never explicitly be moved to disk.</param>
+        /// <returns><see cref="RequestStream"/> instance.</returns>
+        public static RequestStream FromStream( Stream stream, long expectedLength, long thresholdLength, bool disableStreamSwitching )
+        {
+            return new RequestStream( stream, expectedLength, thresholdLength, disableStreamSwitching );
+        }
+
+        /// <summary>Reads a sequence of bytes from the current stream and advances the position within the stream by the number of bytes read.</summary>
+        /// <returns>The total number of bytes read into the buffer. This can be less than the number of bytes requested if that many bytes are not currently available, or zero (0) if the end of the stream has been reached.</returns>
+        /// <param name="buffer">An array of bytes. When this method returns, the buffer contains the specified byte array with the values between <paramref name="offset"/> and (<paramref name="offset"/> + <paramref name="count"/> - 1) replaced by the bytes read from the current source. </param>
+        /// <param name="offset">The zero-based byte offset in <paramref name="buffer"/> at which to begin storing the data read from the current stream. </param>
+        /// <param name="count">The maximum number of bytes to be read from the current stream. </param>
+        public override int Read( byte[] buffer, int offset, int count )
+        {
+            return _stream.Read( buffer, offset, count );
+        }
+
+        /// <summary>Reads a byte from the stream and advances the position within the stream by one byte, or returns -1 if at the end of the stream.</summary>
+        /// <returns>The unsigned byte cast to an Int32, or -1 if at the end of the stream.</returns>
+        public override int ReadByte()
+        {
+            return _stream.ReadByte();
+        }
+
+        /// <summary>Sets the position within the current stream.</summary>
+        /// <returns>The new position within the current stream.</returns>
+        /// <param name="offset">A byte offset relative to the <paramref name="origin"/> parameter. </param>
+        /// <param name="origin">A value of type <see cref="T:System.IO.SeekOrigin"/> indicating the reference point used to obtain the new position. </param>
+        public override long Seek( long offset, SeekOrigin origin )
+        {
+            return _stream.Seek( offset, origin );
+        }
+
+        /// <summary>Sets the length of the current stream.</summary>
+        /// <param name="value">The desired length of the current stream in bytes. </param>
+        /// <exception cref="NotSupportedException">The stream does not support having it's length set.</exception>
+        /// <remarks>This functionality is not supported by the <see cref="RequestStream"/> type and will always throw <see cref="NotSupportedException"/>.</remarks>
+        public override void SetLength( long value )
+        {
+            throw new NotSupportedException();
+        }
+
+        /// <summary>Writes a sequence of bytes to the current stream and advances the current position within this stream by the number of bytes written.</summary>
+        /// <param name="buffer">An array of bytes. This method copies <paramref name="count"/> bytes from <paramref name="buffer"/> to the current stream. </param>
+        /// <param name="offset">The zero-based byte offset in <paramref name="buffer"/> at which to begin copying bytes to the current stream. </param>
+        /// <param name="count">The number of bytes to be written to the current stream. </param>
+        public override void Write( byte[] buffer, int offset, int count )
+        {
+            _stream.Write( buffer, offset, count );
+            ShiftStreamToFileStreamIfNecessary();
+        }
+
+        private void ShiftStreamToFileStreamIfNecessary()
+        {
+            if ( _disableStreamSwitching )
+                return;
+
+            if ( _stream.Length >= _thresholdLength )
+            {
+                var old = _stream;
+                MoveStreamContentsToFileStream();
+                old.Close();
+            }
+        }
+
+        private static FileStream CreateTemporaryFileStream()
+        {
+            var filePath = Path.GetTempFileName();
+            return new FileStream( filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 8192, true );
+        }
+
+        private Stream CreateDefaultMemoryStream( long expectedLength )
+        {
+            _isSafeToDisposeStream = true;
+
+            if ( _disableStreamSwitching || expectedLength < _thresholdLength )
+                return new MemoryStream( ( int ) expectedLength );
+
+            _disableStreamSwitching = true;
+            return CreateTemporaryFileStream();
+        }
+
+        private static void DeleteTemporaryFile( string fileName )
+        {
+            if ( string.IsNullOrEmpty( fileName ) || !File.Exists( fileName ) )
+                return;
+
+            try
+            {
+                File.Delete( fileName );
+            }
+            catch
+            {
+            }
+        }
+
+        private void MoveStreamOutOfMemoryIfContentsLengthExceedThresholdAndSwitchingIsEnabled()
+        {
+            if ( !_stream.CanSeek )
+                return;
+
+            try
+            {
+                if ( ( _stream.Length > _thresholdLength ) && !_disableStreamSwitching )
+                    MoveStreamContentsToFileStream();
+            }
+            catch ( NotSupportedException )
+            {
+            }
+        }
+
+        private bool MoveStreamOutOfMemoryIfExpectedLengthExceedSwitchLength( long expectedLength )
+        {
+            if ( ( expectedLength < _thresholdLength ) || _disableStreamSwitching )
+                return false;
+
+            MoveStreamContentsToFileStream();
+            return true;
+        }
+
+        private void MoveStreamContentsToFileStream()
+        {
+            var targetStream = CreateTemporaryFileStream();
+            _isSafeToDisposeStream = true;
+
+            if ( _stream.CanSeek && _stream.Length == 0 )
+            {
+                _stream.Close();
+                _stream = targetStream;
+                return;
+            }
+
+            if ( _stream.CanSeek )
+                _stream.Position = 0;
+
+            _stream.CopyTo( targetStream, 8196 );
+
+            if ( _stream.CanSeek )
+                _stream.Flush();
+
+            _stream = targetStream;
+            _disableStreamSwitching = true;
+        }
+
+        private static void ThrowExceptionIfCtorParametersWereInvalid( Stream stream, long expectedLength, long thresholdLength )
+        {
+            if ( !stream.CanRead )
+                throw new InvalidOperationException( "The stream must support reading." );
+
+            if ( expectedLength < 0 )
+                throw new ArgumentOutOfRangeException( "expectedLength", expectedLength, "The value of the expectedLength parameter cannot be less than zero." );
+
+            if ( thresholdLength < 0 )
+                throw new ArgumentOutOfRangeException( "thresholdLength", thresholdLength, "The value of the threshHoldLength parameter cannot be less than zero." );
         }
     }
 
@@ -480,7 +983,7 @@ namespace Nano.Web.Core
         }
     }
 
-    /// <summary>Enables CorrelationId support which passes through or creates new CorrelationIds per request in order to support request tracking.</summary>
+    /// <summary>Enables / disables CorrelationId support which passes through or creates new CorrelationIds per request in order to support request tracking.</summary>
     public static class CorrelationIdHelper
     {
         /// <summary>Enables CorrelationId support which passes through or creates new CorrelationIds per request in order to support request tracking.</summary>
@@ -521,9 +1024,109 @@ namespace Nano.Web.Core
             if ( string.IsNullOrWhiteSpace( correlationId ) )
                 correlationId = Guid.NewGuid().ToString();
 
+            nanoContext.CorrelationId = correlationId;
             nanoContext.Response.HeaderParameters.Add( Constants.CorrelationIdRequestParameterName, correlationId );
-            nanoContext.Items.Add( Constants.CorrelationIdRequestParameterName, correlationId );
             System.Runtime.Remoting.Messaging.CallContext.LogicalSetData( Constants.CorrelationIdRequestParameterName, correlationId );
+        }
+    }
+
+    /// <summary>Enables / disables Keep-Alive ( persistent connection ) support.</summary>
+    public static class KeepAliveHelper
+    {
+        private const string KeepAliveIsDisabled = "KeepAliveIsDisabled";
+
+        /// <summary>Enables Keep-Alive ( persistent connection ) support.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void EnableKeepAlive( this NanoConfiguration nanoConfiguration )
+        {
+            nanoConfiguration.GlobalEventHandler.EnableKeepAlive();
+        }
+
+        /// <summary>Disables Keep-Alive ( persistent connection ) support. Note that in a modern web hosting environment applications are typically hosted behind a load balancer and in order to get proper web traffic distribution "Keep Alive" should be disabled.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void DisableKeepAlive( this NanoConfiguration nanoConfiguration )
+        {
+            nanoConfiguration.GlobalEventHandler.DisableKeepAlive();
+        }
+
+        /// <summary>Enables Keep-Alive ( persistent connection ) support.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void EnableKeepAlive( this EventHandler eventHandler )
+        {
+            eventHandler.PreInvokeHandlers.Remove( DisableKeepAlivePreInvokeHandler );
+        }
+
+        /// <summary>Disables Keep-Alive ( persistent connection ) support. Note that in a modern web hosting environment applications are typically hosted behind a load balancer and in order to get proper web traffic distribution "Keep Alive" should be disabled.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void DisableKeepAlive( this EventHandler eventHandler )
+        {
+            if ( eventHandler.PreInvokeHandlers.Contains( DisableKeepAlivePreInvokeHandler ) == false )
+                eventHandler.PreInvokeHandlers.Add( DisableKeepAlivePreInvokeHandler );
+        }
+
+        /// <summary>Enables Keep-Alive ( persistent connection ) support.</summary>
+        /// <param name="nanoContext">The nano context.</param>
+        public static void DisableKeepAlivePreInvokeHandler( NanoContext nanoContext )
+        {
+            nanoContext.Items.Add( KeepAliveIsDisabled, null );
+        }
+
+        /// <summary>Determines if the 'ElapsedMilliseconds" response header is enabled.</summary>
+        /// <param name="nanoContext">The nano context.</param>
+        /// <returns>True if enabled.</returns>
+        public static bool IsKeepAliveDisabled( this NanoContext nanoContext )
+        {
+            return nanoContext.Items.ContainsKey( KeepAliveIsDisabled );
+        }
+    }
+
+    /// <summary>Enables / disables adding an 'ElapsedMilliseconds" response header per request.</summary>
+    public static class ElapsedMillisecondsHelper
+    {
+        private const string ElapsedMillisecondsResponseHeaderIsEnabled = "ElapsedMillisecondsResponseHeaderIsEnabled";
+
+        /// <summary>Enables adding an 'ElapsedMilliseconds" response header per request.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void EnableElapsedMillisecondsResponseHeader( this NanoConfiguration nanoConfiguration )
+        {
+            nanoConfiguration.GlobalEventHandler.EnableElapsedMillisecondsResponseHeader();
+        }
+
+        /// <summary>Disables adding an 'ElapsedMilliseconds" response header per request.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void DisableElapsedMillisecondsResponseHeader( this NanoConfiguration nanoConfiguration )
+        {
+            nanoConfiguration.GlobalEventHandler.DisableElapsedMillisecondsResponseHeader();
+        }
+
+        /// <summary>Enables adding an 'ElapsedMilliseconds" response header per request.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void EnableElapsedMillisecondsResponseHeader( this EventHandler eventHandler )
+        {
+            if ( eventHandler.PreInvokeHandlers.Contains( EnableElapsedMillisecondsResponseHeaderPostInvokeHandler ) == false )
+                eventHandler.PreInvokeHandlers.Add( EnableElapsedMillisecondsResponseHeaderPostInvokeHandler );
+        }
+
+        /// <summary>Disables adding an 'ElapsedMilliseconds" response header per request.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void DisableElapsedMillisecondsResponseHeader( this EventHandler eventHandler )
+        {
+            eventHandler.PreInvokeHandlers.Remove( EnableElapsedMillisecondsResponseHeaderPostInvokeHandler );
+        }
+
+        /// <summary>Enables adding an 'ElapsedMilliseconds" response header per request.</summary>
+        /// <param name="nanoContext">The nano context.</param>
+        public static void EnableElapsedMillisecondsResponseHeaderPostInvokeHandler( NanoContext nanoContext )
+        {
+            nanoContext.Items.Add( ElapsedMillisecondsResponseHeaderIsEnabled, null );
+        }
+
+        /// <summary>Determines if the 'ElapsedMilliseconds" response header is enabled.</summary>
+        /// <param name="nanoContext">The nano context.</param>
+        /// <returns>True if enabled.</returns>
+        public static bool IsElapsedMillisecondsResponseHeaderEnabled( this NanoContext nanoContext )
+        {
+            return nanoContext.Items.ContainsKey( ElapsedMillisecondsResponseHeaderIsEnabled );
         }
     }
 
@@ -547,6 +1150,9 @@ namespace Nano.Web.Core
 
             /// <summary>304 NotModified</summary>
             NotModified = 304,
+
+            /// <summary>401 Unauthorized</summary>
+            Unauthorized = 401,
 
             /// <summary>404 NotFound</summary>
             NotFound = 404,
@@ -576,29 +1182,33 @@ namespace Nano.Web.Core
         /// <summary>CorrelationId request parameter name.</summary>
         public static string CorrelationIdRequestParameterName = "X-CorrelationId";
 
+        /// <summary>Elapsed milliseconds response header name.</summary>
+        public static string ElapsedMillisecondsResponseHeaderName = "X-Nano-ElapsedMilliseconds";
+
         static Constants()
         {
             Assembly assembly = Assembly.GetExecutingAssembly();
 
-            if( assembly.FullName.Contains( "Nano.Web.Core" ) )
+            if ( assembly.FullName.Contains( "Nano.Web.Core" ) )
             {
                 FileVersionInfo fvi = FileVersionInfo.GetVersionInfo( assembly.Location );
                 Version = fvi.FileVersion;
             }
             else
-            {
-                Version = "0.12.0.0";
-            }
+                Version = "0.14.99.0";
         }
 
         /// <summary>Custom error responses.</summary>
         public static class CustomErrorResponse
         {
+            /// <summary>401 Unauthorized custom error response.</summary>
+            public static string Unauthorized401 = "<html><head><title>Unauthorized</title></head><body><h3>Unauthorized: Error 401</h3><p>Oops, access is denied due to invalid credentials.</p></body></html>";
+        
             /// <summary>404 Not Found custom error response.</summary>
             public static string NotFound404 = "<html><head><title>Page Not Found</title></head><body><h3>Page Not Found: Error 404</h3><p>Oops, the page you requested was not found.</p></body></html>";
 
             /// <summary>500 Internal Server Error custom error response.</summary>
-            public static string InternalServerError500 = "<html><head><title>Internal Server Error</title></head><body><h3>Internal Server Error: Error 500</h3><p>Oops, an internal error occurred.</p></body></html>";
+            public static string InternalServerError500 = "<html><head><title>Internal Server Error</title></head><body><h3>Internal Server Error: Error 500</h3><p>Oops, an internal error occurred.</p><!--ErrorMessage--></body></html>";
         }
     }
 
@@ -632,30 +1242,24 @@ namespace Nano.Web.Core
         /// <param name="nanoContext">Current NanoContext.</param>
         public void InvokeUnhandledExceptionHandlers( Exception exception, NanoContext nanoContext )
         {
-            foreach( ErrorHandler unhandledExceptionHandler in UnhandledExceptionHandlers )
-            {
+            foreach ( ErrorHandler unhandledExceptionHandler in UnhandledExceptionHandlers )
                 unhandledExceptionHandler.Invoke( exception, nanoContext );
-            }
         }
 
         /// <summary>Invokes the pre-invoke handlers.</summary>
         /// <param name="nanoContext">Current NanoContext.</param>
         public void InvokePreInvokeHandlers( NanoContext nanoContext )
         {
-            foreach( PreInvokeHandler preInvokeHandler in PreInvokeHandlers )
-            {
+            foreach ( PreInvokeHandler preInvokeHandler in PreInvokeHandlers )
                 preInvokeHandler.Invoke( nanoContext );
-            }
         }
 
         /// <summary>Invokes the post-invoke handlers.</summary>
         /// <param name="nanoContext">Current NanoContext.</param>
         public void InvokePostInvokeHandlers( NanoContext nanoContext )
         {
-            foreach( PostInvokeHandler postInvokeHandler in PostInvokeHandlers )
-            {
+            foreach ( PostInvokeHandler postInvokeHandler in PostInvokeHandlers )
                 postInvokeHandler.Invoke( nanoContext );
-            }
         }
     }
 
@@ -737,9 +1341,7 @@ namespace Nano.Web.Core
         public void InvokeUnhandledExceptionHandlers( Exception exception, BackgroundTaskContext backgroundTaskContext )
         {
             foreach ( ErrorHandler unhandledExceptionHandler in UnhandledExceptionHandlers )
-            {
                 unhandledExceptionHandler.Invoke( exception, backgroundTaskContext );
-            }
         }
 
         /// <summary>Invokes the pre-invoke handlers.</summary>
@@ -747,9 +1349,7 @@ namespace Nano.Web.Core
         public void InvokePreInvokeHandlers( BackgroundTaskContext backgroundTaskContext )
         {
             foreach ( PreInvokeHandler preInvokeHandler in PreInvokeHandlers )
-            {
                 preInvokeHandler.Invoke( backgroundTaskContext );
-            }
         }
 
         /// <summary>Invokes the post-invoke handlers.</summary>
@@ -757,9 +1357,7 @@ namespace Nano.Web.Core
         public void InvokePostInvokeHandlers( BackgroundTaskContext backgroundTaskContext )
         {
             foreach ( PostInvokeHandler postInvokeHandler in PostInvokeHandlers )
-            {
                 postInvokeHandler.Invoke( backgroundTaskContext );
-            }
         }
     }
 
@@ -773,7 +1371,8 @@ namespace Nano.Web.Core
             foreach ( BackgroundTask backgroundTask in nanoConfiguration.BackgroundTasks )
             {
                 BackgroundTask task = backgroundTask;
-                Task.Factory.StartNew( () =>
+                
+                Task.Run( () =>
                 {
                     while ( true )
                     {
@@ -781,24 +1380,15 @@ namespace Nano.Web.Core
 
                         try
                         {
-                            if( backgroundTaskContext.BackgroundTask.AllowOverlappingRuns )
-                            {
-                                // Run async
-                                Task.Factory.StartNew( () => Run( backgroundTaskContext ) );
-                            }
+                            if ( backgroundTaskContext.BackgroundTask.AllowOverlappingRuns )
+                                Task.Run( () => Run( backgroundTaskContext ) ); // Run async
                             else
-                            {
-                                // Run sync
-                                Run( backgroundTaskContext );
-                            }
+                                Run( backgroundTaskContext ); // Run sync
                         }
-                        catch ( Exception )
-                        {
-                            // Big gulp
-                        }
+                        catch ( Exception ) { }
 
                         Thread.Sleep( backgroundTaskContext.BackgroundTask.MillisecondInterval );
-                    }
+                    } // ReSharper disable once FunctionNeverReturns
                 } );
             }
         }
@@ -828,6 +1418,21 @@ namespace Nano.Web.Core
         }
     }
 
+    /// <summary><see cref="NanoConfiguration" /> extensions.</summary>
+    public static class NanoConfigurationExtensions
+    {
+        /// <summary>
+        /// Writes an error message to the operating system event log.
+        /// </summary>
+        /// <param name="nanoConfiguration">The Nano configuration.</param>
+        /// <param name="errorMessage">The error message to write.</param>
+        /// <returns>Indicates whether the error message successfully wrote to the event log.</returns>
+        public static bool WriteErrorToEventLog( this NanoConfiguration nanoConfiguration, string errorMessage )
+        {
+            return EventLogHelper.WriteErrorToEventLog( nanoConfiguration.ApplicationName, errorMessage );
+        }
+    }
+
     /// <summary><see cref="NanoContext" /> extensions.</summary>
     public static class NanoContextExtensions
     {
@@ -851,9 +1456,7 @@ namespace Nano.Web.Core
                 nanoContext.Response.ResponseStreamWriter = stream =>
                 {
                     using ( streamResponse )
-                    {
                         streamResponse.CopyTo( stream );
-                    }
                 };
 
                 return;
@@ -867,7 +1470,7 @@ namespace Nano.Web.Core
             using ( var md5 = System.Security.Cryptography.MD5.Create() )
             {
                 byte[] hash = md5.ComputeHash( bytes );
-                var eTag = BitConverter.ToString( hash ).Replace( "-", string.Empty );
+                var eTag = "\"" + BitConverter.ToString( hash ).Replace( "-", string.Empty) + "\"";
                 nanoContext.Response.HeaderParameters[ "ETag" ] = eTag;
 
                 var requestETag = nanoContext.Request.HeaderParameters[ "If-None-Match" ];
@@ -905,6 +1508,32 @@ namespace Nano.Web.Core
             nanoContext.Response.ResponseStreamWriter = nanoContext.WriteErrorsToStream;
         }
 
+        private static void GenerateHtmlErrorMessage( Exception exception, StringBuilder stringBuilder, int recursionLevel = 0 )
+        {
+            if ( recursionLevel > 25 )
+                return; // Something has most likely went very wrong so return early to avoid a stack overflow
+
+            if ( recursionLevel > 0 )
+            {
+                int marginLeft = recursionLevel * 4;
+                stringBuilder.AppendFormat( "<p style=\"margin-left:{0}px;\"><b>Inner Exception Error Message:</b></p>", marginLeft ).AppendLine();
+                stringBuilder.AppendFormat( "<p style=\"margin-left:{0}px;\">{1}</p>", marginLeft, exception.Message ).AppendLine();
+                stringBuilder.AppendFormat( "<p style=\"margin-left:{0}px;\"><b>Inner Exception Stack Trace:</b></p>", marginLeft ).AppendLine();
+                stringBuilder.AppendFormat( "<p style=\"margin-left:{0}px;\">{1}</p>", marginLeft, exception.StackTrace ).AppendLine();
+            }
+            else
+            {
+                stringBuilder.AppendLine( "<hr />" );
+                stringBuilder.AppendLine( "<p><b>Error Message:</b></p>" );
+                stringBuilder.AppendFormat( "<p>{0}</p>", exception.Message ).AppendLine();
+                stringBuilder.AppendLine( "<p><b>Stack Trace:</b></p>" );
+                stringBuilder.AppendFormat( "<p>{0}</p>", exception.StackTrace ).AppendLine();
+            }
+
+            if (exception.InnerException != null)
+                GenerateHtmlErrorMessage(exception.InnerException, stringBuilder, ++recursionLevel);
+        }
+
         /// <summary>Writes any errors to the response stream.</summary>
         /// <param name="nanoContext">The nano context.</param>
         /// <param name="stream">The stream.</param>
@@ -912,34 +1541,71 @@ namespace Nano.Web.Core
         {
             nanoContext.Response.ContentType = "text/html";
 
-            if( Debugger.IsAttached )
+            if ( nanoContext.NanoConfiguration.LogErrorsToEventLog )
             {
-                string errorString = "<html><head><title>Internal Server Error</title></head><body><h3>Internal Server Error: Error 500</h3><p>Oops, an internal error occurred.</p>{{CustomErrorToken}}</body></html>";
+                var textErrorMessageBuilder = new StringBuilder();
+                textErrorMessageBuilder.AppendLine( "Nano Error:" );
+                textErrorMessageBuilder.AppendLine( "*************" ).AppendLine();
 
-                string customErrorToken = "";
-
-                foreach( Exception exception in nanoContext.Errors )
+                foreach ( Exception exception in nanoContext.Errors )
                 {
-                    string msg = "<hr />";
-                    msg += "<p><b>Error Message:</b></p>";
-                    msg += "<p>" + exception.Message + "</p>";
-                    msg += "<p><b>Inner Exception:</b></p>";
-                    msg += "<p>" + exception.InnerException + "</p>";
-                    msg += "<p><b>Stack Trace:</b></p>";
-                    msg += "<p>" + exception.StackTrace + "</p>";
-
-                    customErrorToken += msg;
+                    nanoContext.WriteNanoContextDataToExceptionData( exception );
+                    EventLogHelper.GenerateTextErrorMessage( exception, textErrorMessageBuilder );
                 }
 
-                errorString = errorString.Replace( "{{CustomErrorToken}}", customErrorToken );
-                stream.Write( errorString );
+                nanoContext.NanoConfiguration.WriteErrorToEventLog( textErrorMessageBuilder.ToString() );
             }
-            else
+
+            var serverHostName = Dns.GetHostName();
+            var clientHostName = GetHostName( nanoContext.Request.ClientIpAddress );
+
+            if ( serverHostName == clientHostName )
             {
-                stream.Write( Constants.CustomErrorResponse.InternalServerError500 );
+                var htmlErrorMessageBuilder = new StringBuilder();
+
+                foreach ( Exception exception in nanoContext.Errors )
+                    GenerateHtmlErrorMessage( exception, htmlErrorMessageBuilder );
+
+                var errorMessage = Constants.CustomErrorResponse.InternalServerError500.Replace( "<!--ErrorMessage-->", htmlErrorMessageBuilder.ToString() );
+                stream.Write( errorMessage );
+                return;
+            }
+
+            stream.Write( Constants.CustomErrorResponse.InternalServerError500 );
+        }
+
+        /// <summary>Gets the host name for the given IP address.</summary>
+        /// <param name="ipAddressString">IP address.</param>
+        /// <returns>Host name.</returns>
+        private static string GetHostName( string ipAddressString )
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(ipAddressString))
+                    return "";
+                var ipAddress = IPAddress.Parse(ipAddressString);
+                var ipHostEntry = Dns.GetHostEntry(ipAddress);
+                var hostNames = ipHostEntry.HostName.Split('.').ToList();
+                return hostNames.FirstOrDefault();
+            }
+            catch ( Exception )
+            {
+                return "";
             }
         }
 
+        /// <summary>Writes NanoContext data to the exceptions key/value pair Data property.</summary>
+        /// <param name="nanoContext">The <see cref="NanoContext"/>.</param>
+        /// <param name="exception">The <see cref="Exception"/> to write data to.</param>
+        public static void WriteNanoContextDataToExceptionData( this NanoContext nanoContext, Exception exception )
+        {
+            exception.Data[ "Request URL" ] = nanoContext.Request.Url.ToString();
+            exception.Data[ "Request CorrelationId" ] = nanoContext.CorrelationId;
+            exception.Data[ "Request Timestamp" ] = nanoContext.RequestTimestamp.ToLocalTime();
+            exception.Data[ "Client IP Address" ] = nanoContext.Request.ClientIpAddress;
+            exception.Data[ "Current User" ] = nanoContext.CurrentUser == null ? "" : nanoContext.CurrentUser.UserName;
+        }
+        
         /// <summary>Returns a file if it exists.</summary>
         /// <param name="nanoContext">The <see cref="NanoContext" />.</param>
         /// <param name="fileInfo">The file to return.</param>
@@ -982,9 +1648,7 @@ namespace Nano.Web.Core
                     nanoContext.Response.ResponseStreamWriter = stream =>
                     {
                         using ( FileStream file = fileInfo.OpenRead() )
-                        {
                             file.CopyTo( stream, ( int ) ( fileInfo.Length < Constants.DefaultFileBufferSize ? fileInfo.Length : Constants.DefaultFileBufferSize ) );
-                        }
                     };
                 }
 
@@ -1103,7 +1767,6 @@ namespace Nano.Web.Core
             try
             {
                 Type underlyingType = Nullable.GetUnderlyingType( type ) ?? type;
-
                 object convertedValue;
 
                 // Try to convert the request parameter value to the method parameter values type
@@ -1225,10 +1888,8 @@ namespace Nano.Web.Core
             get { return _basePath; }
             set
             {
-                if( string.IsNullOrWhiteSpace( value ) )
-                {
+                if ( string.IsNullOrWhiteSpace( value ) )
                     return;
-                }
 
                 _basePath = value.TrimEnd( '/' );
             }
@@ -1421,25 +2082,23 @@ namespace Nano.Web.Core
             /// <param name="eventArgs">The <see cref="EventArgs" /> instance containing the event data.</param>
             public void HttpApplicationOnBeginRequest( dynamic httpApplication, EventArgs eventArgs )
             {
-                HandleRequest( httpApplication.Context, NanoConfiguration );
+                HandleRequest( httpApplication.Context, NanoConfiguration, DateTime.UtcNow );
             }
 
             /// <summary>Handles a System.Web request.</summary>
             /// <param name="httpContext">System.Web.HttpContext.</param>
             /// <param name="nanoConfiguration">The <see cref="NanoConfiguration" />.</param>
-            public static void HandleRequest( dynamic httpContext, NanoConfiguration nanoConfiguration )
+            /// <param name="requestTimestamp">The initial timestamp of the current HTTP request.</param>
+            public static void HandleRequest( dynamic httpContext, NanoConfiguration nanoConfiguration, DateTime requestTimestamp )
             {
-                NanoContext nanoContext = MapHttpContextBaseToNanoContext( httpContext, nanoConfiguration );
-
+                NanoContext nanoContext = MapHttpContextBaseToNanoContext( httpContext, nanoConfiguration, requestTimestamp );
                 nanoContext = RequestRouter.RouteRequest( nanoContext );
 
                 if( nanoContext.RequestHandler == null || nanoContext.Handled == false )
                     return;
 
-                if( nanoContext.Response.ResponseStreamWriter != null )
-                {
+                if ( nanoContext.Response.ResponseStreamWriter != null )
                     nanoContext.Response.ResponseStreamWriter( httpContext.Response.OutputStream );
-                }
 
                 httpContext.Response.Charset = nanoContext.Response.Charset;
                 httpContext.Response.ContentEncoding = nanoContext.Response.ContentEncoding;
@@ -1447,10 +2106,16 @@ namespace Nano.Web.Core
 
                 foreach( string headerName in nanoContext.Response.HeaderParameters )
                     httpContext.Response.Headers.Add( headerName, nanoContext.Response.HeaderParameters[headerName] );
+                
+                if ( nanoContext.IsElapsedMillisecondsResponseHeaderEnabled() )
+                {
+                    var elapsedTime = DateTime.UtcNow - nanoContext.RequestTimestamp;
+                    httpContext.Response.Headers.Add( Constants.ElapsedMillisecondsResponseHeaderName, elapsedTime.TotalMilliseconds.ToString() );
+                }
 
-                foreach( dynamic cookie in nanoContext.Response.Cookies )
+                foreach ( dynamic cookie in nanoContext.Response.Cookies )
                     httpContext.Response.Headers.Add( "Set-Cookie", cookie.ToString() );
-
+                
                 httpContext.Response.StatusCode = nanoContext.Response.HttpStatusCode;
                 httpContext.Response.End();
             }
@@ -1458,8 +2123,9 @@ namespace Nano.Web.Core
             /// <summary>Maps a System.Web.HttpContext to a NanoContext.</summary>
             /// <param name="httpContext">System.Web.HttpContext.</param>
             /// <param name="nanoConfiguration">The <see cref="NanoConfiguration" />.</param>
+            /// <param name="requestTimestamp">The initial timestamp of the current HTTP request.</param>
             /// <returns>Mapped <see cref="NanoContext" />.</returns>
-            public static NanoContext MapHttpContextBaseToNanoContext( dynamic httpContext, NanoConfiguration nanoConfiguration )
+            public static NanoContext MapHttpContextBaseToNanoContext( dynamic httpContext, NanoConfiguration nanoConfiguration, DateTime requestTimestamp )
             {
                 dynamic httpMethod = httpContext.Request.HttpMethod;
 
@@ -1476,10 +2142,11 @@ namespace Nano.Web.Core
                     Path = path,
                     Query = httpContext.Request.Url.Query
                 };
-                
-                Func<Stream> requestBodyAccessor = () => httpContext.Request.InputStream;
-                var nanoRequest = new NanoRequest( httpMethod, url, requestBodyAccessor ) { QueryStringParameters = httpContext.Request.QueryString, FormBodyParameters = httpContext.Request.Form, HeaderParameters = httpContext.Request.Headers };
-                var nanoContext = new NanoContext( nanoRequest, new NanoResponse(), nanoConfiguration ) { HostContext = httpContext, RootFolderPath = nanoConfiguration.ApplicationRootFolderPath };
+
+                RequestStream requestStream = RequestStream.FromStream( httpContext.Request.InputStream, httpContext.Request.Headers[ "Content-Length" ] );
+                var results = RequestBodyParser.ParseRequestBody( httpContext.Request.Headers[ "Content-Type" ], httpContext.Request.ContentEncoding, requestStream, nanoConfiguration.RequestParameterLimit );
+                var nanoRequest = new NanoRequest( httpMethod, url, requestStream, httpContext.Request.QueryString, httpContext.Request.Form, httpContext.Request.Headers, results.Files, httpContext.Request.UserHostAddress );
+                var nanoContext = new NanoContext( nanoRequest, new NanoResponse(), nanoConfiguration, requestTimestamp ) { HostContext = httpContext, RootFolderPath = nanoConfiguration.ApplicationRootFolderPath };
                 return nanoContext;
             }
         }
@@ -1529,6 +2196,17 @@ namespace Nano.Web.Core
                 httpListenerConfiguration.HttpListener.Start();
                 var server = new HttpListenerNanoServer( nanoConfiguration, httpListenerConfiguration );
                 httpListenerConfiguration.HttpListener.BeginGetContext( server.BeginGetContextCallback, server );
+
+                httpListenerConfiguration.UnhandledExceptionHandler = exception =>
+                {
+                    var errorMessage = new StringBuilder()
+                        .AppendLine( "Nano Error:" )
+                        .AppendLine( "*************" ).AppendLine();
+
+                    EventLogHelper.GenerateTextErrorMessage( exception, errorMessage );
+                    nanoConfiguration.WriteErrorToEventLog( errorMessage.ToString() );
+                };
+
                 BackgroundTaskRunner.Start( nanoConfiguration );
                 return server;
             }
@@ -1548,17 +2226,20 @@ namespace Nano.Web.Core
             /// <param name="asyncResult">The asynchronous result.</param>
             public void BeginGetContextCallback( IAsyncResult asyncResult )
             {
+                DateTime requestTimestamp = DateTime.UtcNow;
+
                 try
                 {
                     if ( HttpListenerConfiguration == null || HttpListenerConfiguration.HttpListener == null || HttpListenerConfiguration.HttpListener.IsListening == false )
                         return;
                     HttpListenerContext httpListenerContext = HttpListenerConfiguration.HttpListener.EndGetContext( asyncResult );
                     HttpListenerConfiguration.HttpListener.BeginGetContext( BeginGetContextCallback, this );
-                    HandleRequest( httpListenerContext, this );
+                    HandleRequest( httpListenerContext, this, requestTimestamp );
                 }
                 catch( Exception e )
                 {
-                    if ( HttpListenerConfiguration == null || HttpListenerConfiguration.UnhandledExceptionHandler == null )
+                    if ( HttpListenerConfiguration == null || HttpListenerConfiguration.HttpListener == null || HttpListenerConfiguration.HttpListener.IsListening == false
+                         || HttpListenerConfiguration.UnhandledExceptionHandler == null || ( e.GetType() == typeof ( HttpListenerException ) ) && HttpListenerConfiguration.IgnoreHttpListenerExceptions )
                         return;
                     HttpListenerConfiguration.UnhandledExceptionHandler( e );
                 }
@@ -1567,11 +2248,14 @@ namespace Nano.Web.Core
             /// <summary>Handles the request.</summary>
             /// <param name="httpListenerContext">The HTTP listener context.</param>
             /// <param name="server">The server.</param>
-            public static void HandleRequest( HttpListenerContext httpListenerContext, HttpListenerNanoServer server )
+            /// <param name="requestTimestamp">The initial timestamp of the current HTTP request.</param>
+            public static void HandleRequest( HttpListenerContext httpListenerContext, HttpListenerNanoServer server, DateTime requestTimestamp )
             {
+                NanoContext nanoContext = null;
+
                 try
                 {
-                    NanoContext nanoContext = MapHttpListenerContextToNanoContext( httpListenerContext, server );
+                    nanoContext = MapHttpListenerContextToNanoContext( httpListenerContext, server, requestTimestamp );
 
                     nanoContext = RequestRouter.RouteRequest( nanoContext );
 
@@ -1581,41 +2265,63 @@ namespace Nano.Web.Core
                     httpListenerContext.Response.ContentEncoding = nanoContext.Response.ContentEncoding;
                     httpListenerContext.Response.ContentType = nanoContext.Response.ContentType;
 
-                    foreach( string headerName in nanoContext.Response.HeaderParameters )
+                    if ( nanoContext.IsKeepAliveDisabled() )
                     {
-                        if( !IgnoredHeaders.IsIgnored( headerName ) )
-                        {
-                            httpListenerContext.Response.Headers.Add( headerName, nanoContext.Response.HeaderParameters[headerName] );
-                        }
+                        httpListenerContext.Response.KeepAlive = false;
                     }
 
-                    foreach( NanoCookie cookie in nanoContext.Response.Cookies )
+                    foreach ( string headerName in nanoContext.Response.HeaderParameters )
+                    {
+                        if ( !IgnoredHeaders.IsIgnored( headerName ) )
+                            httpListenerContext.Response.Headers.Add( headerName, nanoContext.Response.HeaderParameters[ headerName ] );
+                    }
+                    
+                    if ( nanoContext.IsElapsedMillisecondsResponseHeaderEnabled() )
+                    {
+                        var elapsedTime = DateTime.UtcNow - nanoContext.RequestTimestamp;
+                        httpListenerContext.Response.Headers.Add( Constants.ElapsedMillisecondsResponseHeaderName, elapsedTime.TotalMilliseconds.ToString() );
+                    }
+
+                    foreach ( NanoCookie cookie in nanoContext.Response.Cookies )
                         httpListenerContext.Response.Headers.Add( "Set-Cookie", cookie.ToString() );
 
                     httpListenerContext.Response.StatusCode = nanoContext.Response.HttpStatusCode;
 
-                    if( nanoContext.Response.ResponseStreamWriter != null )
+                    if ( nanoContext.Response.ResponseStreamWriter != null )
                     {
-                        if( IsGZipSupported( httpListenerContext ) )
+                        if ( IsGZipSupported( httpListenerContext ) )
                         {
                             httpListenerContext.Response.Headers.Add( "Content-Encoding", "gzip" );
 
-                            using( Stream outputStream = httpListenerContext.Response.OutputStream )
-                            {
-                                using( var gZipStream = new GZipStream( outputStream, CompressionMode.Compress, true ) )
-                                {
-                                    nanoContext.Response.ResponseStreamWriter( gZipStream );
-                                }
-                            }
+                            using ( var gZipStream = new GZipStream(httpListenerContext.Response.OutputStream, CompressionMode.Compress, true ) )
+                                nanoContext.Response.ResponseStreamWriter( gZipStream );
                         }
                         else
-                        {
-                            using( Stream outputStream = httpListenerContext.Response.OutputStream )
-                            {
-                                nanoContext.Response.ResponseStreamWriter( outputStream );
-                            }
-                        }
+                            nanoContext.Response.ResponseStreamWriter( httpListenerContext.Response.OutputStream );
                     }
+                }
+                catch ( Exception exception )
+                {
+                    try
+                    {
+                        httpListenerContext.Response.OutputStream.Write( Constants.CustomErrorResponse.InternalServerError500 ); // Attempt to write an error message
+                    }
+                    catch ( Exception )
+                    {
+                         /* Gulp */
+                    }
+
+                    if ( exception.GetType() == typeof ( HttpListenerException ) && server.HttpListenerConfiguration.IgnoreHttpListenerExceptions )
+                    {
+                        return;
+                    }
+
+                    if ( nanoContext != null )
+                    {
+                        nanoContext.WriteNanoContextDataToExceptionData( exception );
+                    }
+
+                    throw;
                 }
                 finally
                 {
@@ -1630,10 +2336,8 @@ namespace Nano.Web.Core
             {
                 string encoding = httpListenerContext.Request.Headers["Accept-Encoding"];
 
-                if( !string.IsNullOrEmpty( encoding ) && encoding.Contains( "gzip" ) )
-                {
+                if ( !string.IsNullOrEmpty( encoding ) && encoding.Contains( "gzip" ) )
                     return true;
-                }
 
                 return false;
             }
@@ -1641,19 +2345,17 @@ namespace Nano.Web.Core
             /// <summary>Maps a <see cref="System.Net.HttpListenerContext" /> to <see cref="NanoContext" />.</summary>
             /// <param name="httpListenerContext">The HTTP listener context.</param>
             /// <param name="server">The server.</param>
+            /// <param name="requestTimestamp">The initial timestamp of the current HTTP request.</param>
             /// <returns>Mapped <see cref="NanoContext" />.</returns>
-            public static NanoContext MapHttpListenerContextToNanoContext( HttpListenerContext httpListenerContext, HttpListenerNanoServer server )
+            public static NanoContext MapHttpListenerContextToNanoContext( HttpListenerContext httpListenerContext, HttpListenerNanoServer server, DateTime requestTimestamp )
             {
                 string httpMethod = httpListenerContext.Request.HttpMethod;
-
                 string basePath = String.Empty;
-
-				string path = "/" + httpListenerContext.Request.Url.AbsolutePath.TrimStart( '/' );
+				string path = "/" + httpListenerContext.Request.Url.AbsolutePath.TrimStart( '/' ).ToLower();
 
                 if ( string.IsNullOrWhiteSpace( server.HttpListenerConfiguration.ApplicationPath ) == false )
                 {
-                    basePath = "/" + server.HttpListenerConfiguration.ApplicationPath.TrimStart( '/' ).TrimEnd( '/' );
-
+                    basePath = "/" + server.HttpListenerConfiguration.ApplicationPath.TrimStart( '/' ).TrimEnd( '/' ).ToLower();
 					if ( path.StartsWith( basePath ) ) path = path.Substring( basePath.Length );
                 }
                 
@@ -1668,10 +2370,11 @@ namespace Nano.Web.Core
                     Path = path,
                     Query = httpListenerContext.Request.Url.Query
                 };
-
-                Func<Stream> requestBodyAccessor = () => httpListenerContext.Request.InputStream;
-                var nanoRequest = new NanoRequest( httpMethod, url, requestBodyAccessor ) { QueryStringParameters = httpListenerContext.Request.QueryString, FormBodyParameters = ParseFormBodyParameters( httpListenerContext, server ), HeaderParameters = httpListenerContext.Request.Headers };
-                var nanoContext = new NanoContext( nanoRequest, new NanoResponse(), server.NanoConfiguration ) { HostContext = httpListenerContext, RootFolderPath = server.NanoConfiguration.ApplicationRootFolderPath };
+                
+                RequestStream requestStream = RequestStream.FromStream( httpListenerContext.Request.InputStream, httpListenerContext.Request.Headers["Content-Length"] );
+                var results = RequestBodyParser.ParseRequestBody( httpListenerContext.Request.Headers[ "Content-Type" ], httpListenerContext.Request.ContentEncoding, requestStream, server.NanoConfiguration.RequestParameterLimit );
+                var nanoRequest = new NanoRequest( httpMethod, url, requestStream, httpListenerContext.Request.QueryString, results.FormBodyParameters, httpListenerContext.Request.Headers, results.Files, httpListenerContext.Request.RemoteEndPoint == null ? null : httpListenerContext.Request.RemoteEndPoint.Address.ToString() );
+                var nanoContext = new NanoContext( nanoRequest, new NanoResponse(), server.NanoConfiguration, requestTimestamp ) { HostContext = httpListenerContext, RootFolderPath = server.NanoConfiguration.ApplicationRootFolderPath };
                 return nanoContext;
             }
 
@@ -1680,63 +2383,6 @@ namespace Nano.Web.Core
             public static string GetApplicationRootFolderPath()
             {
                 return AppDomain.CurrentDomain.BaseDirectory;
-            }
-
-            /// <summary>Parses the form body parameters.</summary>
-            /// <param name="httpListenerContext">The HTTP listener context.</param>
-            /// <param name="server">The server.</param>
-            /// <returns><see cref="NameValueCollection" /> of the form body parameters.</returns>
-            /// <exception cref="System.Exception">The maximum number of form parameters posted was exceeded.</exception>
-            public static NameValueCollection ParseFormBodyParameters( HttpListenerContext httpListenerContext, HttpListenerNanoServer server )
-            {
-                var nameValueCollection = new NameValueCollection();
-
-                if( httpListenerContext.Request.HasEntityBody == false )
-                    return nameValueCollection;
-
-                string contentType = httpListenerContext.Request.Headers["Content-Type"];
-
-                if( string.IsNullOrWhiteSpace( contentType ) )
-                    return nameValueCollection;
-
-                string mimeType = contentType.Split( ';' ).FirstOrDefault();
-
-                if( string.IsNullOrWhiteSpace( mimeType ) )
-                    return nameValueCollection;
-
-                if( mimeType.ToLower() == "application/x-www-form-urlencoded" )
-                {
-                    var sr = new StreamReader( httpListenerContext.Request.InputStream, httpListenerContext.Request.ContentEncoding );
-                    string formData = sr.ReadToEnd();
-
-                    string[] parameters = formData.Split( '&' );
-
-                    if( parameters.Length > server.HttpListenerConfiguration.MaximumFormParameters )
-                        throw new Exception( "The maximum number of form parameters posted was exceeded." );
-
-                    foreach( string parameter in parameters )
-                    {
-                        string[] keyValuePair = parameter.Split( '=' );
-                        string decodedKey = UrlDecode(keyValuePair[0]);
-                        string decodedValue = UrlDecode(keyValuePair[1]);
-                        nameValueCollection.Add(decodedKey, decodedValue);
-                    }
-
-                    return nameValueCollection;
-                }
-
-                return nameValueCollection;
-            }
-
-            /// <summary>Decodes a URL string.</summary>
-            /// <param name="text">String to decode.</param>
-            /// <returns>Decoded string</returns>
-            public static string UrlDecode( string text )
-            {
-                // pre-process for + sign space formatting since System.Uri doesn't handle it
-                // plus literals are encoded as %2b normally so this should be safe
-                text = text.Replace( "+", " " );
-                return Uri.UnescapeDataString( text );
             }
 
             /// <summary>
@@ -1815,24 +2461,20 @@ namespace Nano.Web.Core
         /// <summary>
         /// <see cref="System.Net.HttpListener" /> configuration.
         /// </summary>
-        public class HttpListenerConfiguration
+        public class HttpListenerConfiguration : IDisposable
         {
             /// <summary>The HTTP listener.</summary>
             public System.Net.HttpListener HttpListener;
             
-            /// <summary>The maximum form parameters.</summary>
-            public int MaximumFormParameters = 10000;
-
             /// <summary>
             /// Invoked on unhandled exceptions that occur during the HttpListenerContext to NanoContext mapping. Note: These will
-            /// *not* be called for normal Nano exceptions which are handled by the Nano event handlers. Defaults to writing to Trace
-            /// output.
+            /// *not* be called for normal Nano exceptions which are handled by the Nano event handlers.
             /// </summary>
-            public Action<Exception> UnhandledExceptionHandler = exception =>
-            {
-                string message = string.Format( "---\n{0}\n---\n", exception );
-                Trace.Write( message );
-            };
+            public Action<Exception> UnhandledExceptionHandler;
+
+            /// <summary>Ignore all <see cref="HttpListenerException"/>s that occur. Defaults to <see langword="true"/>.</summary>
+            /// <remarks>The most common scenario is when the underlying client connection closes but the server is still trying to send a response. In this case there is nothing that can be done except ignore the exception which is the intent of this configuration setting.</remarks>
+            public bool IgnoreHttpListenerExceptions = true;
 
             /// <summary>
             /// Gets or sets a property that determines if localhost uris are rewritten to htp://+:port/ style uris to allow for
@@ -1857,6 +2499,7 @@ namespace Nano.Web.Core
             public HttpListenerConfiguration( IList<Uri> uris, bool rewriteLocalhost = false )
             {
                 HttpListener = new System.Net.HttpListener();
+                HttpListener.IgnoreWriteExceptions = true;
                 RewriteLocalhost = rewriteLocalhost;
                 AddPrefixes( uris );
             }
@@ -1893,6 +2536,38 @@ namespace Nano.Web.Core
                     uriBuilder.Path = ApplicationPath + "/";
 
                 return uriBuilder.Uri.ToString();
+            }
+
+            /// <summary>
+            /// Dispose resources
+            /// </summary>
+            public void Dispose()
+            {
+                Dispose( true );
+                GC.SuppressFinalize( this );
+            }
+
+            /// <summary>
+            /// Dispose the HttpListener
+            /// </summary>
+            /// <param name="disposing"></param>
+            protected virtual void Dispose( bool disposing )
+            {
+                try
+                {
+                    if ( true )
+                    {
+
+                        if ( HttpListener == null ) return;
+
+                        HttpListener.Close();
+
+                        HttpListener = null;
+                    }
+                }
+                catch ( ObjectDisposedException )
+                {
+                }
             }
         }
     }
@@ -1970,33 +2645,40 @@ namespace Nano.Web.Core
             {
                 try
                 {
-                    if( EventHandler != null )
-                        EventHandler.InvokePreInvokeHandlers( nanoContext );
+                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokePreInvokeHandlers(nanoContext);
 
-                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokePreInvokeHandlers( nanoContext );
+                    if (EventHandler != null)
+                        EventHandler.InvokePreInvokeHandlers(nanoContext);
 
-                    if( nanoContext.Handled )
+                    if (nanoContext.Handled)
                         return nanoContext;
 
-                    nanoContext = HandleRequest( nanoContext );
+                    nanoContext = HandleRequest(nanoContext);
                     return nanoContext;
                 }
-                catch( Exception e )
+                catch (Exception e)
                 {
-                    nanoContext.Errors.Add( e );
+                    if (e is TargetInvocationException && e.InnerException != null)
+                        e = e.InnerException;
+                            // Hide Nano's outer 'TargetInvocationException' and just use the inner exception which is what almost everyone is going to desire
+
+                    nanoContext.Errors.Add(e);
                     nanoContext.ReturnHttp500InternalServerError();
 
-                    if( EventHandler != null )
-                        EventHandler.InvokeUnhandledExceptionHandlers( e, nanoContext );
+                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokeUnhandledExceptionHandlers(e, nanoContext);
 
-                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokeUnhandledExceptionHandlers( e, nanoContext );
+                    if (EventHandler != null)
+                        EventHandler.InvokeUnhandledExceptionHandlers(e, nanoContext);
                 }
                 finally
                 {
-                    if( EventHandler != null )
-                        EventHandler.InvokePostInvokeHandlers( nanoContext );
+                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokePostInvokeHandlers(nanoContext);
 
-                    nanoContext.NanoConfiguration.GlobalEventHandler.InvokePostInvokeHandlers( nanoContext );
+                    if (EventHandler != null)
+                        EventHandler.InvokePostInvokeHandlers(nanoContext);
+
+                    if ( nanoContext.Response.ResponseStreamWriter == null )
+                        nanoContext.WriteResponseObjectToResponseStream();
                 }
 
                 return nanoContext;
@@ -2015,7 +2697,7 @@ namespace Nano.Web.Core
 		/// </summary>
 		public abstract class FileSystemRequestHandler : RequestHandler
 		{
-			private static readonly ConcurrentDictionary<string, string> _paths = new ConcurrentDictionary<string, string>();
+			private static readonly ConcurrentDictionary<string, string> Paths = new ConcurrentDictionary<string, string>();
             
 			static FileSystemRequestHandler() 
 			{
@@ -2052,7 +2734,7 @@ namespace Nano.Web.Core
             /// <returns>The valid case-sensitive path or null.</returns>
 			protected string GetPathCaseSensitive( string path )
 			{
-				if ( _paths.ContainsKey( path ) ) return _paths[path];
+				if ( Paths.ContainsKey( path ) ) return Paths[path];
 
 				string[] segments = path.Split( new[] { Constants.DirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries );
 
@@ -2064,7 +2746,7 @@ namespace Nano.Web.Core
 
 					if ( i == segments.Length - 1 )
 					{
-						if ( result != null ) _paths[path] = result;
+						if ( result != null ) Paths[path] = result;
 
 						return result;
 					} 
@@ -2127,7 +2809,7 @@ namespace Nano.Web.Core
             /// <summary>Gets or sets the default documents.</summary>
             /// <value>The default documents.</value>
             public IList<string> DefaultDocuments { get; set; }
-
+            
             /// <summary>Handles the request.</summary>
             /// <param name="nanoContext">The <see cref="NanoContext" />.</param>
             /// <returns>Handled <see cref="NanoContext" />.</returns>
@@ -2138,41 +2820,69 @@ namespace Nano.Web.Core
                 string encodedPartialRequestPath = partialRequestPath.Replace( "/", Constants.DirectorySeparatorString ).TrimStart( Constants.DirectorySeparatorChar );
                 string fullFileSystemPath = Path.Combine( nanoContext.RootFolderPath, FileSystemPath, encodedPartialRequestPath );
 
-				if ( IsCaseSensitiveFileSystem ) fullFileSystemPath = GetPathCaseSensitive( fullFileSystemPath );
+                if ( IsCaseSensitiveFileSystem ) fullFileSystemPath = GetPathCaseSensitive( fullFileSystemPath );
 
-				if ( !String.IsNullOrWhiteSpace( fullFileSystemPath ) )
-				{					
-					if ( nanoContext.TryReturnFile( new FileInfo( fullFileSystemPath ) ) ) return nanoContext;
-                
-					var directoryInfo = new DirectoryInfo( fullFileSystemPath );			
+                if ( !string.IsNullOrWhiteSpace( fullFileSystemPath ) && !ContainsInvalidPathCharacters( fullFileSystemPath ) )
+                {
+                    FileInfo fileInfo = null;
 
-					if ( directoryInfo.Exists )
-					{
-						// If the URL does not end with a forward slash then redirect to the same URL with a forward slash
-						// so that relative URLs will work correctly
-						if ( nanoContext.Request.Url.Path.EndsWith( "/", StringComparison.Ordinal ) == false )
-						{
-							string url = nanoContext.Request.Url.BasePath + nanoContext.Request.Url.Path + "/" + nanoContext.Request.Url.Query;
-							nanoContext.Response.Redirect( url );
-							return nanoContext;
-						}
+                    try
+                    {
+                        fileInfo = new FileInfo(fullFileSystemPath);
+                    }
+                    catch ( ArgumentException )
+                    {
+                        return nanoContext.ReturnHttp404NotFound();
+                    }
 
-						foreach ( string defaultDocument in DefaultDocuments )
-						{
-							string path = Path.Combine( fullFileSystemPath, defaultDocument );
+                    if ( nanoContext.TryReturnFile( fileInfo ) ) return nanoContext;
 
-							if ( IsCaseSensitiveFileSystem )
-								path = GetPathCaseSensitive( path );
+                    var directoryInfo = new DirectoryInfo( fullFileSystemPath );
 
-							if ( nanoContext.TryReturnFile( new FileInfo( path ) ) )
-								return nanoContext;
-						}
-					}
-				}
+                    if ( directoryInfo.Exists )
+                    {
+                        // If the URL does not end with a forward slash then redirect to the same URL with a forward slash
+                        // so that relative URLs will work correctly
+                        if ( nanoContext.Request.Url.Path.EndsWith( "/", StringComparison.Ordinal ) == false )
+                        {
+                            string url = nanoContext.Request.Url.BasePath + nanoContext.Request.Url.Path + "/" + nanoContext.Request.Url.Query;
+                            nanoContext.Response.Redirect( url );
+                            return nanoContext;
+                        }
 
-                if( ReturnHttp404WhenFileWasNoFound ) return nanoContext.ReturnHttp404NotFound();
+                        foreach ( string defaultDocument in DefaultDocuments )
+                        {
+                            string path = Path.Combine( fullFileSystemPath, defaultDocument );
+
+                            if ( IsCaseSensitiveFileSystem )
+                                path = GetPathCaseSensitive( path );
+
+                            if ( nanoContext.TryReturnFile( new FileInfo( path ) ) )
+                                return nanoContext;
+                        }
+                    }
+                }
+
+                if ( ReturnHttp404WhenFileWasNoFound ) return nanoContext.ReturnHttp404NotFound();
 
                 return nanoContext;
+            }
+
+            /// <summary>Determines if the path contains invalid characters.</summary>
+            /// <remarks>This method is intended to prevent ArgumentException's from being thrown when creating a new FileInfo on a file path with invalid characters.</remarks>
+            /// <param name="filePath">File path.</param>
+            /// <returns>True if file path contains invalid characters.</returns>
+            private static bool ContainsInvalidPathCharacters(string filePath)
+            {
+                for (var i = 0; i < filePath.Length; i++)
+                {
+                    int c = filePath[i];
+                    
+                    if (c == '\"' || c == '<' || c == '>' || c == '|' || c == '*' || c == '?' || c < 32)
+                        return true;
+                }
+
+                return false;
             }
 
             /// <summary>
@@ -2192,6 +2902,7 @@ namespace Nano.Web.Core
             }
 
             /// <summary>Root Directory exception.</summary>
+            [Serializable]
             public class RootDirectoryException : Exception
             {
                 /// <summary>Initializes a new instance of the <see cref="RootDirectoryException" /> class.</summary>
@@ -2268,8 +2979,7 @@ namespace Nano.Web.Core
 
                 if ( string.IsNullOrWhiteSpace( nanoContext.Response.ContentType ) )
                     nanoContext.Response.ContentType =  "application/json";
-
-                nanoContext.WriteResponseObjectToResponseStream();
+                
                 return nanoContext;
             }
         }
@@ -2292,6 +3002,7 @@ namespace Nano.Web.Core
             {
                 nanoContext.Handled = true;
                 var apiMetadata = new ApiMetadata();
+                apiMetadata.ApplicationName = nanoContext.NanoConfiguration.ApplicationName;
 
                 foreach( MethodRequestHandler methodRequestHandler in nanoContext.NanoConfiguration.RequestHandlers.OfType<MethodRequestHandler>() )
                 {
@@ -2300,7 +3011,7 @@ namespace Nano.Web.Core
                     if( metadataProvider == null )
                         continue;
 
-                    var metadata = new OperationMetaData { UrlPath = methodRequestHandler.UrlPath };
+                    var metadata = new OperationMetaData { UrlPath = methodRequestHandler.CaseSensitiveUrlPath };
                     metadata.Name = metadataProvider.GetOperationName( nanoContext, methodRequestHandler );
                     metadata.Description = metadataProvider.GetOperationDescription( nanoContext, methodRequestHandler );
                     IList<MethodParameter> parameters = metadataProvider.GetOperationParameters( nanoContext, methodRequestHandler );
@@ -2320,13 +3031,13 @@ namespace Nano.Web.Core
 
                     var returnParameterType = metadataProvider.GetOperationReturnParameterType( nanoContext, methodRequestHandler );
                     metadata.ReturnParameterType = GetTypeName( returnParameterType );
+
                     AddModels( apiMetadata, returnParameterType );
                     apiMetadata.Operations.Add( metadata );
                 }
 
                 nanoContext.Response.ResponseObject = apiMetadata;
                 nanoContext.Response.ContentType = "application/json";
-                nanoContext.WriteResponseObjectToResponseStream();
                 return nanoContext;
             }
 
@@ -2335,17 +3046,32 @@ namespace Nano.Web.Core
             /// <param name="type">Type to crawl.</param>
             public static void AddModels( ApiMetadata apiMetadata, Type type )
             {
+                if ( type == null || type.FullName == null )
+                    return;
+
                 var nestedUserTypes = new List<Type>();
 
                 if( type.IsGenericType )
                 {
-                    type = type.GetGenericArguments().FirstOrDefault();
+                    type = type.GetGenericTypeDefinition();
+
+                    var types = type.GetGenericArguments();
+                    foreach ( var t in types )
+                    {
+                        if ( t.FullName == null )
+                            continue;
+
+                        nestedUserTypes.Add( t );
+                    }
+
+                    foreach ( Type nestedUserType in nestedUserTypes )
+                        AddModels( apiMetadata, nestedUserType );
                 }
 
                 // Adding all user types as "Models"
-                if( IsUserType( type ) && apiMetadata.Models.Any( x => x.Type == type.Name ) == false )
+                if ( type != null && IsUserType( type ) && apiMetadata.Models.Any( x => x.Type == type.Name ) == false )
                 {
-                    var modelMetadata = new ModelMetadata { Type = type.Name, Description = GetDescription( type ) };
+                    var modelMetadata = new ModelMetadata { Type = GetTypeName( type ), Description = GetDescription( type ) };
                     FieldInfo[] fields = type.GetFields();
 
                     foreach( FieldInfo field in fields )
@@ -2437,45 +3163,45 @@ namespace Nano.Web.Core
                                          type.Namespace.StartsWith( "System" ) == false &&
                                          type.Namespace.StartsWith( "Microsoft" ) == false );
             }
-
-            /// <summary>Determines if a type is a nested User Type meaning it is not a standard .NET type.</summary>
-            /// <param name="type">Type.</param>
-            /// <returns>Boolean value.</returns>
-            public static bool IsNestedUserType( Type type )
-            {
-                if( type.IsGenericType )
-                {
-                    type = type.GetGenericArguments().FirstOrDefault();
-                }
-
-                return IsUserType( type );
-            }
-
-            /// <summary>Gets the type name.</summary>
+            
+            /// <summary>
+            /// Gets the type name.
+            /// </summary>
             /// <param name="type">Type.</param>
             /// <returns>Type name.</returns>
             public static string GetTypeName( Type type )
             {
+                if ( type == null )
+                    return "";
+
+                if ( type.FullName == null )
+                    return type.Name;
+
+                string name = type.Name.Replace( '+', '.' );
+
                 if ( type.IsGenericType )
                 {
-                    var genericArgument = type.GetGenericArguments().FirstOrDefault();
+                    int backtickIndex = name.IndexOf( '`' );
 
-                    var genericIndex = type.FullName.IndexOf( "`1", StringComparison.Ordinal );
-
-                    if ( genericArgument != null && genericIndex > 1 )
+                    if ( backtickIndex > 0 )
                     {
-                        var typeName = type.FullName.Substring( 0, genericIndex );
-
-                        return typeName + "<" + genericArgument.Name + ">";
+                        name = name.Remove( backtickIndex ); // Get string before backtick. ie. "Nullable`1" becomes "Nullable"
                     }
+
+                    name += "<";
+
+                    var typeParameters = type.GetGenericArguments();
+
+                    for ( var i = 0; i < typeParameters.Length; ++i )
+                    {
+                        string typeParameterName = GetTypeName( typeParameters[ i ] );
+                        name += ( i == 0 ? typeParameterName : "," + typeParameterName );
+                    }
+
+                    name += ">";
                 }
 
-                Type underlyingType = Nullable.GetUnderlyingType( type );
-
-                if( underlyingType != null )
-                    return "Nullable<" + underlyingType.Name + ">";
-
-                return type.Name;
+                return name;
             }
         }
 
@@ -2514,6 +3240,10 @@ namespace Nano.Web.Core
             /// <value>The description.</value>
             public string Description { get; set; }
 
+            /// <summary>The case sensitive URL path for this handler.</summary>
+            /// <value>The case sensitive URL path.</value>
+            public string CaseSensitiveUrlPath { get; set; }
+
             /// <summary>Handles the request.</summary>
             /// <param name="nanoContext">The <see cref="NanoContext" />.</param>
             /// <returns>Handled <see cref="NanoContext" />.</returns>
@@ -2527,8 +3257,9 @@ namespace Nano.Web.Core
                 if( nanoContext.Response.ResponseObject == null || nanoContext.Response.ResponseObject == nanoContext )
                     return nanoContext;
 
-                nanoContext.Response.ContentType = "application/json";
-                nanoContext.WriteResponseObjectToResponseStream();
+                if ( string.IsNullOrWhiteSpace( nanoContext.Response.ContentType ) )
+                    nanoContext.Response.ContentType = "application/json";
+                
                 return nanoContext;
             }
 
@@ -2637,7 +3368,7 @@ namespace Nano.Web.Core
                         }
 
                         // Handle nullable parameters
-                        if( Nullable.GetUnderlyingType( methodParameter.Type ) != null )
+                        if( Nullable.GetUnderlyingType( methodParameter.Type ) != null || ( !methodParameter.Type.IsValueType ) )
                         {
                             methodInvokationParameters.Add( null );
                             continue;
@@ -2787,7 +3518,10 @@ namespace Nano.Web.Core
         public class ApiMetadata
         {
             /// <summary>Api metadata version.</summary>
-            public string Version = "0.2.0";
+            public string Version = "0.3.0";
+
+            /// <summary>Application name..</summary>
+            public string ApplicationName = AppDomain.CurrentDomain.FriendlyName;
 
             /// <summary>The API models.</summary>
             public IList<ModelMetadata> Models = new List<ModelMetadata>();
@@ -2902,7 +3636,6 @@ namespace Nano.Web.Core
             public static bool TryParseJson( this ISerializationService serializationService, string input, Type type, bool isDynamic, out object deserializedObject )
             {
                 input = input.Trim();
-
                 bool isJson = IsJson( input );
 
                 if( isJson )
@@ -3610,9 +4343,7 @@ namespace Nano.Web.Core
                 foreach( ParameterInfo parameterInfo in methodInfo.GetParameters().OrderBy( x => x.Position ) )
                 {
                     if( parameterList.Length > 0 )
-                    {
                         parameterList += ",";
-                    }
 
                     parameterList += GetParameterTypeName( methodInfo, parameterInfo );
                 }
@@ -3834,7 +4565,6 @@ namespace Nano.Web.Core
 
                 // Note we are explicitly using InnerXml so that we can support adding HTML in the XML comments! =)
                 string summary = FormatXmlInnerText( summaryNode.InnerXml );
-
                 return summary;
             }
 
@@ -3909,12 +4639,11 @@ namespace Nano.Web.Core
                     {
                         if( value is string )
                             value = new Guid( value as string );
-                        if( value is byte[] )
+                        else if( value is byte[] )
                             value = new Guid( value as byte[] );
                     }
 
                     object result = Convert.ChangeType( value, underlyingType );
-
                     return result;
                 }
                 catch( Exception exception )
@@ -3955,42 +4684,627 @@ namespace Nano.Web.Core
                 }
             }
         }
+
+        /// <summary>Provides helper methods for writing to the operating system event log.</summary>
+        public static class EventLogHelper
+        {
+            /// <summary>Writes an error message to the operating system event log.</summary>
+            /// <param name="applicationName">The application name.</param>
+            /// <param name="errorMessage">The error message to write.</param>
+            /// <returns>Indicates whether the error message successfully wrote to the event log.</returns>
+            public static bool WriteErrorToEventLog( string applicationName, string errorMessage )
+            {
+                bool successfullyWroteToEventLog = true;
+
+                try
+                {
+                    if ( !EventLog.SourceExists( applicationName ) )
+                        EventLog.CreateEventSource( applicationName, "Application" );
+
+                    if (errorMessage.Length > 31788)
+                        errorMessage = errorMessage.Substring(0, 31788) + " ...Log Message Truncated. Maximum length is 31839.";
+
+                    EventLog.WriteEntry( applicationName, errorMessage, EventLogEntryType.Error );
+                }
+                catch ( Exception )
+                {
+                    successfullyWroteToEventLog = false;
+                }
+
+                if ( Environment.UserInteractive )
+                    Console.WriteLine( errorMessage );
+
+                return successfullyWroteToEventLog;
+            }
+
+            /// <summary>Generates a text-based error message.</summary>
+            /// <param name="exception">The exception to generate the error message from.</param>
+            /// <param name="sb">StringBuilder instance to append the error message to.</param>
+            /// <param name="recursionLevel">The number of iterations this method has been called recursively.</param>
+            public static void GenerateTextErrorMessage( Exception exception, StringBuilder sb, int recursionLevel = 0 )
+            {
+                if ( recursionLevel > 25 )
+                    return; // Something has most likely went very wrong so return early to avoid a stack overflow
+
+                string prefix = "";
+
+                if ( recursionLevel > 0 )
+                {
+                    for ( int i = 0; i < recursionLevel; i++ )
+                        prefix += "  ";
+
+                    prefix += "Inner ";
+                }
+
+                sb.AppendSection( prefix, "Exception Information" );
+                sb.AppendDetails( prefix, "Exception Type", exception.GetType().ToString() );
+                sb.AppendDetails( prefix, "Exception Message", exception.Message );
+                sb.AppendLine( exception.StackTrace ).AppendLine();
+
+                using ( var currentProcess = Process.GetCurrentProcess() )
+                {
+                    var ipGlobalProperties = IPGlobalProperties.GetIPGlobalProperties();
+
+                    sb.AppendSection( prefix, "Application Information" );
+                    sb.AppendDetails( prefix, "Machine Name", ipGlobalProperties.HostName + "." + ipGlobalProperties.DomainName );
+                    sb.AppendDetails( prefix, "Domain User", Environment.UserDomainName + "\\" + Environment.UserName );
+                    sb.AppendDetails( prefix, "Application Domain Name", AppDomain.CurrentDomain.FriendlyName );
+                    sb.AppendDetails( prefix, "Process Name", currentProcess.ProcessName );
+                    sb.AppendDetails( prefix, "Process Id", currentProcess.Id.ToString() );
+                }
+
+                if ( exception.Data.Keys.Count > 0 )
+                {
+                    sb.AppendLine().AppendSection( prefix, "Additional Information" );
+
+                    foreach ( DictionaryEntry dictionaryEntry in exception.Data )
+                    {
+                        sb.AppendDetails( prefix, dictionaryEntry.Key.ToString(), dictionaryEntry.Value == null ? "" : dictionaryEntry.Value.ToString() );
+                    }
+
+                    sb.AppendLine();
+                }
+
+                if ( exception.InnerException != null )
+                    GenerateTextErrorMessage( exception.InnerException, sb, ++recursionLevel );
+            }
+
+            private static StringBuilder AppendSection(this StringBuilder sb, string prefix, string sectionName )
+            {
+                return sb.AppendFormat( "{0}{1}:", prefix, sectionName ).AppendLine();
+            }
+
+            private static StringBuilder AppendDetails( this StringBuilder sb, string prefix, string detailName, string detailValue )
+            {
+                return sb.AppendFormat("{0}  {1}: {2}", prefix, detailName, detailValue ).AppendLine();
+            }
+        }
+
+        #region Multipart
+
+        /* Note that the entire Multipart implementation was borrowed from the Nancy project. */
+        internal class Multipart
+        {
+            /// <summary>Retrieves <see cref="HttpMultipartBoundary"/> instances from a request stream.</summary>
+            internal class HttpMultipart
+            {
+                private const byte Lf = (byte)'\n';
+                private readonly HttpMultipartBuffer _readBuffer;
+                private readonly Stream _requestStream;
+
+                /// <summary>Initializes a new instance of the <see cref="HttpMultipart"/> class.</summary>
+                /// <param name="requestStream">The request stream to parse.</param>
+                /// <param name="boundary">The boundary marker to look for.</param>
+                public HttpMultipart(Stream requestStream, string boundary)
+                {
+                    _requestStream = requestStream;
+                    var boundaryAsBytes = GetBoundaryAsBytes(boundary, false);
+                    var closingBoundaryAsBytes = GetBoundaryAsBytes(boundary, true);
+                    _readBuffer = new HttpMultipartBuffer(boundaryAsBytes, closingBoundaryAsBytes);
+                }
+
+                /// <summary>Gets the <see cref="HttpMultipartBoundary"/> instances from the request stream.</summary>
+                /// <returns>An <see cref="IEnumerable{T}"/> instance, containing the found <see cref="HttpMultipartBoundary"/> instances.</returns>
+                public IEnumerable<HttpMultipartBoundary> GetBoundaries(int requestQueryFormMultipartLimit)
+                {
+                    var list = new List<HttpMultipartBoundary>();
+
+                    foreach (var boundaryStream in GetBoundarySubStreams(requestQueryFormMultipartLimit))
+                        list.Add(new HttpMultipartBoundary(boundaryStream));
+
+                    return list;
+                }
+
+                private IEnumerable<HttpMultipartSubStream> GetBoundarySubStreams(int requestQueryFormMultipartLimit)
+                {
+                    var boundarySubStreams = new List<HttpMultipartSubStream>();
+                    var boundaryStart = GetNextBoundaryPosition();
+
+                    var found = 0;
+                    while (MultipartIsNotCompleted(boundaryStart) && found < requestQueryFormMultipartLimit)
+                    {
+                        var boundaryEnd = GetNextBoundaryPosition();
+                        boundarySubStreams.Add(new HttpMultipartSubStream(_requestStream, boundaryStart, GetActualEndOfBoundary(boundaryEnd)));
+                        boundaryStart = boundaryEnd;
+                        found++;
+                    }
+
+                    return boundarySubStreams;
+                }
+
+                private bool MultipartIsNotCompleted(long boundaryPosition)
+                {
+                    return boundaryPosition > -1 && !_readBuffer.IsClosingBoundary;
+                }
+
+                private long GetActualEndOfBoundary(long boundaryEnd)
+                {
+                    if (CheckIfFoundEndOfStream())
+                        return _requestStream.Position - (_readBuffer.Length + 2); // Add two because or the \r\n before the boundary
+
+                    return boundaryEnd - (_readBuffer.Length + 2); // Add two because or the \r\n before the boundary
+                }
+
+                private bool CheckIfFoundEndOfStream()
+                {
+                    return _requestStream.Position.Equals(_requestStream.Length);
+                }
+
+                private static byte[] GetBoundaryAsBytes(string boundary, bool closing)
+                {
+                    var boundaryBuilder = new StringBuilder();
+
+                    boundaryBuilder.Append("--");
+                    boundaryBuilder.Append(boundary);
+
+                    if (closing)
+                        boundaryBuilder.Append("--");
+                    else
+                    {
+                        boundaryBuilder.Append('\r');
+                        boundaryBuilder.Append('\n');
+                    }
+
+                    var bytes = Encoding.ASCII.GetBytes(boundaryBuilder.ToString());
+                    return bytes;
+                }
+
+                private long GetNextBoundaryPosition()
+                {
+                    _readBuffer.Reset();
+                    while (true)
+                    {
+                        var byteReadFromStream = _requestStream.ReadByte();
+
+                        if (byteReadFromStream == -1)
+                            return -1;
+
+                        _readBuffer.Insert((byte)byteReadFromStream);
+
+                        if (_readBuffer.IsFull && (_readBuffer.IsBoundary || _readBuffer.IsClosingBoundary))
+                            return _requestStream.Position;
+
+                        if (byteReadFromStream.Equals(Lf) || _readBuffer.IsFull)
+                            _readBuffer.Reset();
+                    }
+                }
+            }
+
+            /// <summary>A buffer that is used to locate a HTTP multipart/form-data boundary in a stream.</summary>
+            internal class HttpMultipartBuffer
+            {
+                private readonly byte[] _boundaryAsBytes;
+                private readonly byte[] _closingBoundaryAsBytes;
+                private readonly byte[] _buffer;
+                private int _position;
+
+                /// <summary>Initializes a new instance of the <see cref="HttpMultipartBuffer"/> class.</summary>
+                /// <param name="boundaryAsBytes">The boundary as a byte-array.</param>
+                /// <param name="closingBoundaryAsBytes">The closing boundary as byte-array</param>
+                public HttpMultipartBuffer(byte[] boundaryAsBytes, byte[] closingBoundaryAsBytes)
+                {
+                    _boundaryAsBytes = boundaryAsBytes;
+                    _closingBoundaryAsBytes = closingBoundaryAsBytes;
+                    _buffer = new byte[_boundaryAsBytes.Length];
+                }
+
+                /// <summary>Gets a value indicating whether the buffer contains the same values as the boundary.</summary>
+                /// <value><see langword="true"/> if buffer contains the same values as the boundary; otherwise, <see langword="false"/>.</value>
+                public bool IsBoundary
+                {
+                    get { return _buffer.SequenceEqual(_boundaryAsBytes); }
+                }
+
+                /// <summary>Indicates whether this is the closing boundary.</summary>
+                public bool IsClosingBoundary
+                {
+                    get { return _buffer.SequenceEqual(_closingBoundaryAsBytes); }
+                }
+
+                /// <summary>Gets a value indicating whether this buffer is full.</summary>
+                /// <value><see langword="true"/> if buffer is full; otherwise, <see langword="false"/>.</value>
+                public bool IsFull
+                {
+                    get { return _position.Equals(_buffer.Length); }
+                }
+
+                /// <summary>Gets the number of bytes that can be stored in the buffer.</summary>
+                /// <value>The number of bytes that can be stored in the buffer.</value>
+                public int Length
+                {
+                    get { return _buffer.Length; }
+                }
+
+                /// <summary>Resets the buffer so that inserts happens from the start again.</summary>
+                /// <remarks>This does not clear any previously written data, just resets the buffer position to the start. Data that is inserted after Reset has been called will overwrite old data.</remarks>
+                public void Reset()
+                {
+                    _position = 0;
+                }
+
+                /// <summary>Inserts the specified value into the buffer and advances the internal position.</summary>
+                /// <param name="value">The value to insert into the buffer.</param>
+                /// <remarks>This will throw an <see cref="ArgumentOutOfRangeException"/> is you attempt to call insert more times then the <see cref="Length"/> of the buffer and <see cref="Reset"/> was not invoked.</remarks>
+                public void Insert(byte value)
+                {
+                    _buffer[_position++] = value;
+                }
+            }
+
+            /// <summary>Represents the content boundary of a HTTP multipart/form-data boundary in a stream.</summary>
+            internal class HttpMultipartBoundary
+            {
+                private const byte Lf = (byte)'\n';
+                private const byte Cr = (byte)'\r';
+
+                /// <summary>Initializes a new instance of the <see cref="HttpMultipartBoundary"/> class.</summary>
+                /// <param name="boundaryStream">The stream that contains the boundary information.</param>
+                public HttpMultipartBoundary(HttpMultipartSubStream boundaryStream)
+                {
+                    Value = boundaryStream;
+                    ExtractHeaders();
+                }
+
+                /// <summary>Gets the contents type of the boundary value.</summary>
+                /// <value>A <see cref="string"/> containing the name of the value if it is available; otherwise <see cref="string.Empty"/>.</value>
+                public string ContentType { get; private set; }
+
+                /// <summary>Gets or the filename for the boundary value.</summary>
+                /// <value>A <see cref="string"/> containing the filename value if it is available; otherwise <see cref="string.Empty"/>.</value>
+                /// <remarks>This is the RFC2047 decoded value of the filename attribute of the Content-Disposition header.</remarks>
+                public string Filename { get; private set; }
+
+                /// <summary>Gets name of the boundary value.</summary>
+                /// <remarks>This is the RFC2047 decoded value of the name attribute of the Content-Disposition header.</remarks>
+                public string Name { get; private set; }
+
+                /// <summary>A stream containing the value of the boundary.</summary>
+                /// <remarks>This is the RFC2047 decoded value of the Content-Type header.</remarks>
+                public HttpMultipartSubStream Value { get; private set; }
+
+                private void ExtractHeaders()
+                {
+                    while (true)
+                    {
+                        var header = ReadLineFromStream(Value);
+
+                        if (string.IsNullOrEmpty(header))
+                            break;
+
+                        if (header.StartsWith("Content-Disposition", StringComparison.CurrentCultureIgnoreCase))
+                        {
+                            Name = Regex.Match(header, @"name=""?(?<name>[^\""]*)", RegexOptions.IgnoreCase).Groups["name"].Value;
+                            Filename = Regex.Match(header, @"filename=""?(?<filename>[^\""]*)", RegexOptions.IgnoreCase).Groups["filename"].Value;
+                        }
+
+                        if (header.StartsWith("Content-Type", StringComparison.InvariantCultureIgnoreCase))
+                            ContentType = header.Split(' ').Last().Trim();
+                    }
+
+                    Value.PositionStartAtCurrentLocation();
+                }
+
+                private static string ReadLineFromStream(Stream stream)
+                {
+                    var readBuffer = new List<byte>();
+
+                    while (true)
+                    {
+                        var byteReadFromStream = stream.ReadByte();
+
+                        if (byteReadFromStream == -1)
+                            return null;
+
+                        if (byteReadFromStream.Equals(Lf))
+                            break;
+
+                        readBuffer.Add((byte)byteReadFromStream);
+                    }
+
+                    return Encoding.UTF8.GetString(readBuffer.ToArray()).Trim((char)Cr);
+                }
+            }
+
+            /// <summary>A decorator stream that sits on top of an existing stream and appears as a unique stream.</summary>
+            internal class HttpMultipartSubStream : Stream
+            {
+                private readonly Stream _stream;
+                private long _start;
+                private readonly long _end;
+                private long _position;
+
+                /// <summary>Initializes a new instance of the <see cref="HttpMultipartSubStream"/> class.</summary>
+                /// <param name="stream">The stream to create the sub-stream ontop of.</param>
+                /// <param name="start">The start offset on the parent stream where the sub-stream should begin.</param>
+                /// <param name="end">The end offset on the parent stream where the sub-stream should end.</param>
+                public HttpMultipartSubStream(Stream stream, long start, long end)
+                {
+                    _stream = stream;
+                    _start = start;
+                    _position = start;
+                    _end = end;
+                }
+
+                /// <summary>When overridden in a derived class, gets a value indicating whether the current stream supports reading.</summary>
+                /// <returns><see langword="true"/> if the stream supports reading; otherwise, <see langword="false"/>.</returns>
+                public override bool CanRead
+                {
+                    get { return true; }
+                }
+
+                /// <summary>When overridden in a derived class, gets a value indicating whether the current stream supports seeking.</summary>
+                /// <returns><see langword="true"/> if the stream supports seeking; otherwise, <see langword="false"/>.</returns>
+                public override bool CanSeek
+                {
+                    get { return true; }
+                }
+
+                /// <summary>When overridden in a derived class, gets a value indicating whether the current stream supports writing.</summary>
+                /// <returns><see langword="true"/> if the stream supports writing; otherwise, <see langword="false"/>.</returns>
+                public override bool CanWrite
+                {
+                    get { return false; }
+                }
+
+                /// <summary>When overridden in a derived class, gets the length in bytes of the stream.</summary>
+                /// <returns>A long value representing the length of the stream in bytes.</returns>
+                /// <exception cref="NotSupportedException">A class derived from Stream does not support seeking. </exception><exception cref="T:System.ObjectDisposedException">Methods were called after the stream was closed.</exception>
+                public override long Length
+                {
+                    get { return (_end - _start); }
+                }
+
+                /// <summary>When overridden in a derived class, gets or sets the position within the current stream.</summary>
+                /// <returns>The current position within the stream.</returns>
+                /// <exception cref="T:System.IO.IOException">An I/O error occurs. </exception><exception cref="T:System.NotSupportedException">The stream does not support seeking. </exception><exception cref="T:System.ObjectDisposedException">Methods were called after the stream was closed. </exception><filterpriority>1</filterpriority>
+                public override long Position
+                {
+                    get { return _position - _start; }
+                    set { _position = Seek(value, SeekOrigin.Begin); }
+                }
+
+                private long CalculateSubStreamRelativePosition(SeekOrigin origin, long offset)
+                {
+                    var subStreamRelativePosition = 0L;
+
+                    switch (origin)
+                    {
+                        case SeekOrigin.Begin:
+                            subStreamRelativePosition = _start + offset;
+                            break;
+                        case SeekOrigin.Current:
+                            subStreamRelativePosition = _position + offset;
+                            break;
+                        case SeekOrigin.End:
+                            subStreamRelativePosition = _end + offset;
+                            break;
+                    }
+                    return subStreamRelativePosition;
+                }
+
+                /// <summary>Sets the start position at the current location.</summary>
+                public void PositionStartAtCurrentLocation()
+                {
+                    _start = _stream.Position;
+                }
+
+                /// <summary>When overridden in a derived class, clears all buffers for this stream and causes any buffered data to be written to the underlying device.</summary>
+                /// <remarks>In the <see cref="HttpMultipartSubStream"/> type this method is implemented as no-op.</remarks>
+                public override void Flush()
+                {
+                }
+
+                /// <summary>When overridden in a derived class, reads a sequence of bytes from the current stream and advances the position within the stream by the number of bytes read.</summary>
+                /// <returns>The total number of bytes read into the buffer. This can be less than the number of bytes requested if that many bytes are not currently available, or zero (0) if the end of the stream has been reached. </returns>
+                /// <param name="buffer">An array of bytes. When this method returns, the buffer contains the specified byte array with the values between <paramref name="offset"/> and (<paramref name="offset"/> + <paramref name="count"/> - 1) replaced by the bytes read from the current source. </param>
+                /// <param name="offset">The zero-based byte offset in <paramref name="buffer"/> at which to begin storing the data read from the current stream.</param>
+                /// <param name="count">The maximum number of bytes to be read from the current stream. </param>
+                public override int Read(byte[] buffer, int offset, int count)
+                {
+                    if (count > (_end - _position))
+                        count = (int)(_end - _position);
+
+                    if (count <= 0)
+                        return 0;
+
+                    _stream.Position = _position;
+                    var bytesReadFromStream = _stream.Read(buffer, offset, count);
+                    RepositionAfterRead(bytesReadFromStream);
+                    return bytesReadFromStream;
+                }
+
+                /// <summary>Reads a byte from the stream and advances the position within the stream by one byte, or returns -1 if at the end of the stream.</summary>
+                /// <returns>The unsigned byte cast to an Int32, or -1 if at the end of the stream.</returns>
+                public override int ReadByte()
+                {
+                    if (_position >= _end)
+                        return -1;
+
+                    _stream.Position = _position;
+                    var byteReadFromStream = _stream.ReadByte();
+                    RepositionAfterRead(1);
+                    return byteReadFromStream;
+                }
+
+                private void RepositionAfterRead(int bytesReadFromStream)
+                {
+                    if (bytesReadFromStream == -1)
+                        _position = _end;
+                    else
+                        _position += bytesReadFromStream;
+                }
+
+                /// <summary>When overridden in a derived class, sets the position within the current stream.</summary>
+                /// <returns>The new position within the current stream.</returns>
+                /// <param name="offset">A byte offset relative to the <paramref name="origin"/> parameter.</param>
+                /// <param name="origin">A value of type <see cref="SeekOrigin"/> indicating the reference point used to obtain the new position.</param>
+                public override long Seek(long offset, SeekOrigin origin)
+                {
+                    var subStreamRelativePosition =
+                        CalculateSubStreamRelativePosition(origin, offset);
+
+                    if (subStreamRelativePosition < 0 || subStreamRelativePosition > _end)
+                        throw new InvalidOperationException();
+
+                    _position = _stream.Seek(subStreamRelativePosition, SeekOrigin.Begin);
+                    return _position;
+                }
+
+                /// <summary>When overridden in a derived class, sets the length of the current stream.</summary>
+                /// <param name="value">The desired length of the current stream in bytes.</param>
+                /// <remarks>This will always throw a <see cref="InvalidOperationException"/> for the <see cref="HttpMultipartSubStream"/> type.</remarks>
+                public override void SetLength(long value)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                /// <summary>When overridden in a derived class, writes a sequence of bytes to the current stream and advances the current position within this stream by the number of bytes written.</summary>
+                /// <param name="buffer">An array of bytes. This method copies <paramref name="count"/> bytes from <paramref name="buffer"/> to the current stream. </param>
+                /// <param name="offset">The zero-based byte offset in <paramref name="buffer"/> at which to begin copying bytes to the current stream. </param>
+                /// <param name="count">The number of bytes to be written to the current stream. </param>
+                /// <remarks>This will always throw a <see cref="InvalidOperationException"/> for the <see cref="HttpMultipartSubStream"/> type.</remarks>
+                public override void Write(byte[] buffer, int offset, int count)
+                {
+                    throw new InvalidOperationException();
+                }
+            }
+        }
+
+        #endregion Multipart
+
+        internal static class RequestBodyParser
+        {
+            internal class RequestBodyParserResults
+            {
+                internal readonly IList<HttpFile> Files = new List<HttpFile>();
+                internal readonly NameValueCollection FormBodyParameters = new NameValueCollection();
+            }
+
+            internal static RequestBodyParserResults ParseRequestBody( string contentType, Encoding contentEncoding, Stream requestBody, int parameterLimit )
+            {
+                var results = new RequestBodyParserResults();
+
+                if ( string.IsNullOrWhiteSpace( contentType ) )
+                    return results;
+
+                string mimeType = contentType.Split( ';' ).FirstOrDefault();
+
+                if ( string.IsNullOrWhiteSpace( mimeType ) )
+                    return results;
+
+                if ( mimeType.Equals( "application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase ) )
+                {
+                    var sr = new StreamReader( requestBody, contentEncoding );
+                    string formData = sr.ReadToEnd();
+
+                    if ( string.IsNullOrWhiteSpace( formData ) )
+                        return results;
+
+                    string[] parameters = formData.Split( '&' );
+
+                    if ( parameters.Length > parameterLimit )
+                        throw new Exception( "The limit of " + parameterLimit + " request parameters sent was exceeded. The reason to limit the number of parameters processed by the server is detailed in the following security notice regarding a DoS attack vector: http://www.ocert.org/advisories/ocert-2011-003.html" );
+
+                    foreach ( string parameter in parameters )
+                    {
+                        if ( parameter.Contains( '=' ) == false )
+                            throw new Exception( "Can not parse the malformed form-urlencoded request parameters. Current parameter being parsed: " + parameter );
+
+                        string[] keyValuePair = parameter.Split( '=' );
+                        string decodedKey = UrlDecode( keyValuePair[ 0 ] );
+                        string decodedValue = UrlDecode( keyValuePair[ 1 ] );
+                        results.FormBodyParameters.Add( decodedKey, decodedValue );
+                    }
+
+                    return results;
+                }
+
+                if ( !mimeType.Equals( "multipart/form-data", StringComparison.OrdinalIgnoreCase ) )
+                    return results;
+
+                var boundary = Regex.Match( contentType, @"boundary=""?(?<token>[^\n\;\"" ]*)" ).Groups[ "token" ].Value;
+                var multipart = new Multipart.HttpMultipart( requestBody, boundary );
+
+                foreach ( var httpMultipartBoundary in multipart.GetBoundaries( parameterLimit ) )
+                {
+                    if ( string.IsNullOrEmpty( httpMultipartBoundary.Filename ) )
+                    {
+                        var reader = new StreamReader( httpMultipartBoundary.Value );
+                        results.FormBodyParameters.Add( httpMultipartBoundary.Name, reader.ReadToEnd() );
+                    }
+                    else
+                        results.Files.Add( new HttpFile( httpMultipartBoundary.ContentType, httpMultipartBoundary.Filename, httpMultipartBoundary.Value, httpMultipartBoundary.Name ) );
+                }
+
+                requestBody.Position = 0;
+
+                return results;
+            }
+
+            /// <summary>Decodes a URL string.</summary>
+            /// <param name="text">String to decode.</param>
+            /// <returns>Decoded string</returns>
+            public static string UrlDecode(string text)
+            {
+                return Uri.UnescapeDataString(text.Replace("+", " "));
+            }
+        }
     }
 
     #endregion Nano.Web.Core.Internal
 
     #region Open Source Attributions
 
-/*
-Open Source Attributions
-------------------------
-Nano made use of substantial portions and/or was heavily influenced by the following open source software:
+    /*
+    Open Source Attributions
+    ------------------------
+    Nano made use of substantial portions and/or was heavily influenced by the following open source software:
 
- - Nancy: https://github.com/NancyFx/Nancy
+     - Nancy: https://github.com/NancyFx/Nancy
 
-        The MIT License
-        Copyright (c) 2010 Andreas Håkansson, Steven Robbins and contributors
-        License available at: https://github.com/NancyFx/Nancy/blob/master/license.txt
+            The MIT License
+            Copyright (c) 2010 Andreas Håkansson, Steven Robbins and contributors
+            License available at: https://github.com/NancyFx/Nancy/blob/master/license.txt
 
- - Katana Project: http://katanaproject.codeplex.com/
+     - Katana Project: http://katanaproject.codeplex.com/
 
-        Apache License
-        Copyright (c) Microsoft Open Technologies, Inc. All rights reserved.
-        License available at: http://katanaproject.codeplex.com/SourceControl/latest#LICENSE.txt
+            Apache License
+            Copyright (c) Microsoft Open Technologies, Inc. All rights reserved.
+            License available at: http://katanaproject.codeplex.com/SourceControl/latest#LICENSE.txt
 
- - DynamicDictionary: https://github.com/randyburden/DynamicDictionary
+     - DynamicDictionary: https://github.com/randyburden/DynamicDictionary
 
-        The MIT License
-        Copyright (c) 2014 Randy Burden ( http://randyburden.com ) All rights reserved.
-        License available at: https://github.com/randyburden/DynamicDictionary/blob/master/LICENSE
+            The MIT License
+            Copyright (c) 2014 Randy Burden ( http://randyburden.com ) All rights reserved.
+            License available at: https://github.com/randyburden/DynamicDictionary/blob/master/LICENSE
 
- - JSON.NET: https://github.com/JamesNK/Newtonsoft.Json
+     - JSON.NET: https://github.com/JamesNK/Newtonsoft.Json
 
-        The MIT License
-        Copyright (c) 2007 James Newton-King
-        License available at: https://github.com/JamesNK/Newtonsoft.Json/blob/master/LICENSE.md
-    
-*/
+            The MIT License
+            Copyright (c) 2007 James Newton-King
+            License available at: https://github.com/JamesNK/Newtonsoft.Json/blob/master/LICENSE.md
+
+    */
 
     #endregion Open Source Attributions
 }

@@ -4,15 +4,16 @@ Nano
 <a href="https://www.nuget.org/packages/Nano"><img src="https://img.shields.io/nuget/v/Nano.svg" alt="NuGet Version" /></a> 
 <a href="https://www.nuget.org/packages/Nano"><img src="https://img.shields.io/nuget/dt/Nano.svg" alt="NuGet Download Count" /></a>
 
-AppVeyor ( Windows ):
-<a href="https://ci.appveyor.com/project/AmbitEnergyLabs/nano">
-	<img src="https://ci.appveyor.com/api/projects/status/github/ambitenergylabs/nano?svg=true" alt="AppVeyor Windows Build Status" />
-</a>
+**Build Status**
 
-Travis CI ( Linux ):
-<a href="https://travis-ci.org/AmbitEnergyLabs/Nano">
-	<img src="https://travis-ci.org/AmbitEnergyLabs/Nano.svg" alt="Travis CI Linux Build Status" />
-</a>
+| Windows             | Linux             |
+| ------------------- | ------------------|
+| [![windows][1]][2]  | [![linux][3]][4]  |
+
+[1]: https://ci.appveyor.com/api/projects/status/github/ambitenergylabs/nano?svg=true
+[2]: https://ci.appveyor.com/project/AmbitEnergyLabs/nano
+[3]: https://travis-ci.org/AmbitEnergyLabs/Nano.svg
+[4]: https://travis-ci.org/AmbitEnergyLabs/Nano
 
 Nano is a .NET cross-platform micro web framework for building web-based HTTP services and websites.
 
@@ -20,12 +21,12 @@ Nano is a .NET cross-platform micro web framework for building web-based HTTP se
  - Low ceremony so that you can focus on business logic and not infrastructure and framework hassles
  - Auto generated web interfaces for invoking your web apis ( Api Explorer )
  - Self-host in an executable or integrate into a new or existing ASP.NET application with ease
- - It can be used as a [C# single file drop in](https://raw.githubusercontent.com/AmbitEnergyLabs/Nano/master/src/Nano/Nano.cs) or referenced as a [NuGet Package](https://www.nuget.org/packages/Nano).
+ - It can be used as a [C# single file drop in](https://raw.githubusercontent.com/AmbitEnergyLabs/Nano/v0.14.0/src/Nano/Nano.cs) or referenced as a [NuGet Package](https://www.nuget.org/packages/Nano).
 
 *Note: This project in currently in beta. The API has stabilized and we have not had to make a breaking change in quite some time. We will continue to add new features while in beta and are essentially just waiting for 4 different projects in flight to come out of development and into production use in order to make a determination of when we will declare version 1.0, meaning it is production certified and ready for widespread use for the masses.*
 
 Live demo hosted on AppHarbor: [Nano ApiExplorer Demo](http://nano-1.apphb.com/ApiExplorer/)
- - [Api Explorer single file drop in](https://github.com/AmbitEnergyLabs/Nano/blob/master/src/Nano.Demo.TopshelfSelfHost/www/ApiExplorer/index.html)
+ - [Api Explorer single file drop in](https://raw.githubusercontent.com/AmbitEnergyLabs/Nano/v0.14.0/src/Nano.Demo.SelfHost.WindowsService/www/ApiExplorer/index.html)
 
 Project Background
 ---
