@@ -104,6 +104,9 @@ namespace Nano.Web.Core
         /// <summary>Determines whether errors are logged to the operating system event log.</summary>
         public bool LogErrorsToEventLog = true;
 
+        /// <summary>Determines whether errors are logged to the operating system event log.</summary>
+        public bool EnableVerboseErrors = false;
+
         /// <summary>Application name.</summary>
         public string ApplicationName = AppDomain.CurrentDomain.FriendlyName;
 
@@ -221,6 +224,19 @@ namespace Nano.Web.Core
 
             return builder.ToString();
 		}
+    }
+
+    public class WrappedResponse
+    {
+        public object Value;
+        public Error Error;
+    }
+
+    public class Error
+    {
+        public string Message;
+        public string Code;
+        public object Data;
     }
 
     /// <summary>The context of the current web request.</summary>
@@ -403,6 +419,7 @@ namespace Nano.Web.Core
         public NanoResponse()
         {
             HeaderParameters.Add( "X-Nano-Version", Constants.Version );
+            HeaderParameters.Add( "X-Frame-Options", "DENY");
         }
 
         /// <summary>
@@ -1030,6 +1047,67 @@ namespace Nano.Web.Core
         }
     }
 
+    /// <summary>Enables / disables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+    public static class WrappedResponseHelper
+    {
+        /// <summary>Enables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void EnableWrappedResponse(this NanoConfiguration nanoConfiguration)
+        {
+            nanoConfiguration.GlobalEventHandler.EnableWrappedResponse();
+        }
+
+        /// <summary>Disables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+        /// <param name="nanoConfiguration">The nano configuration.</param>
+        public static void DisableWrappedResponse(this NanoConfiguration nanoConfiguration)
+        {
+            nanoConfiguration.GlobalEventHandler.DisableWrappedResponse();
+        }
+
+        /// <summary>Enables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void EnableWrappedResponse(this EventHandler eventHandler)
+        {
+            if (eventHandler.PostInvokeHandlers.Contains(EnableWrappedResponsePostInvokeHandler) == false)
+                eventHandler.PostInvokeHandlers.Add(EnableWrappedResponsePostInvokeHandler);
+        }
+
+        /// <summary>Disables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+        /// <param name="eventHandler">The event handler.</param>
+        public static void DisableWrappedResponse(this EventHandler eventHandler)
+        {
+            eventHandler.PostInvokeHandlers.Remove(EnableWrappedResponsePostInvokeHandler);
+        }
+
+        /// <summary>Enables Wrapped Response support which creates a response object with Value and Error properties.</summary>
+        /// <param name="nanoContext">The nano context.</param>
+        public static void EnableWrappedResponsePostInvokeHandler(NanoContext nanoContext)
+        {
+            var wrappedResponse = new WrappedResponse { Value = nanoContext.Response.ResponseObject };
+
+            var contextError = nanoContext.Errors.FirstOrDefault();
+
+            if (contextError != null)
+            {
+                var errorCode = string.Concat(contextError.GetType().FullName.Select((x, i) => i > 0 && char.IsUpper(x) ? "_" + x.ToString() : x.ToString())).ToUpper();
+                wrappedResponse.Error = new Error { Message = contextError.Message, Code = errorCode, Data = new
+                {
+                    Stack = contextError.StackTrace,
+                    ExceptionData = contextError.Data,
+                    ProcessInfo = Process.GetCurrentProcess(),
+                    InnerExceptions = contextError.InnerException
+                }};
+                if (!nanoContext.NanoConfiguration.EnableVerboseErrors)
+                {
+                    wrappedResponse.Error.Message = "";
+                }
+            }
+
+            nanoContext.Response.ResponseObject = wrappedResponse;
+        }
+
+    }
+
     /// <summary>Enables / disables Keep-Alive ( persistent connection ) support.</summary>
     public static class KeepAliveHelper
     {
@@ -1605,7 +1683,7 @@ namespace Nano.Web.Core
             exception.Data[ "Client IP Address" ] = nanoContext.Request.ClientIpAddress;
             exception.Data[ "Current User" ] = nanoContext.CurrentUser == null ? "" : nanoContext.CurrentUser.UserName;
         }
-        
+
         /// <summary>Returns a file if it exists.</summary>
         /// <param name="nanoContext">The <see cref="NanoContext" />.</param>
         /// <param name="fileInfo">The file to return.</param>
@@ -2649,7 +2727,7 @@ namespace Nano.Web.Core
 
                     if (EventHandler != null)
                         EventHandler.InvokePreInvokeHandlers(nanoContext);
-
+                    
                     if (nanoContext.Handled)
                         return nanoContext;
 
@@ -2660,7 +2738,7 @@ namespace Nano.Web.Core
                 {
                     if (e is TargetInvocationException && e.InnerException != null)
                         e = e.InnerException;
-                            // Hide Nano's outer 'TargetInvocationException' and just use the inner exception which is what almost everyone is going to desire
+                    // Hide Nano's outer 'TargetInvocationException' and just use the inner exception which is what almost everyone is going to desire
 
                     nanoContext.Errors.Add(e);
                     nanoContext.ReturnHttp500InternalServerError();
@@ -2809,7 +2887,7 @@ namespace Nano.Web.Core
             /// <summary>Gets or sets the default documents.</summary>
             /// <value>The default documents.</value>
             public IList<string> DefaultDocuments { get; set; }
-            
+
             /// <summary>Handles the request.</summary>
             /// <param name="nanoContext">The <see cref="NanoContext" />.</param>
             /// <returns>Handled <see cref="NanoContext" />.</returns>
@@ -2820,7 +2898,7 @@ namespace Nano.Web.Core
                 string encodedPartialRequestPath = partialRequestPath.Replace( "/", Constants.DirectorySeparatorString ).TrimStart( Constants.DirectorySeparatorChar );
                 string fullFileSystemPath = Path.Combine( nanoContext.RootFolderPath, FileSystemPath, encodedPartialRequestPath );
 
-                if ( IsCaseSensitiveFileSystem ) fullFileSystemPath = GetPathCaseSensitive( fullFileSystemPath );
+				if ( IsCaseSensitiveFileSystem ) fullFileSystemPath = GetPathCaseSensitive( fullFileSystemPath );
 
                 if ( !string.IsNullOrWhiteSpace( fullFileSystemPath ) && !ContainsInvalidPathCharacters( fullFileSystemPath ) )
                 {
@@ -2837,31 +2915,31 @@ namespace Nano.Web.Core
 
                     if ( nanoContext.TryReturnFile( fileInfo ) ) return nanoContext;
 
-                    var directoryInfo = new DirectoryInfo( fullFileSystemPath );
+                    var directoryInfo = new DirectoryInfo( fullFileSystemPath );			
 
-                    if ( directoryInfo.Exists )
-                    {
-                        // If the URL does not end with a forward slash then redirect to the same URL with a forward slash
-                        // so that relative URLs will work correctly
-                        if ( nanoContext.Request.Url.Path.EndsWith( "/", StringComparison.Ordinal ) == false )
-                        {
-                            string url = nanoContext.Request.Url.BasePath + nanoContext.Request.Url.Path + "/" + nanoContext.Request.Url.Query;
-                            nanoContext.Response.Redirect( url );
-                            return nanoContext;
-                        }
+					if ( directoryInfo.Exists )
+					{
+						// If the URL does not end with a forward slash then redirect to the same URL with a forward slash
+						// so that relative URLs will work correctly
+						if ( nanoContext.Request.Url.Path.EndsWith( "/", StringComparison.Ordinal ) == false )
+						{
+							string url = nanoContext.Request.Url.BasePath + nanoContext.Request.Url.Path + "/" + nanoContext.Request.Url.Query;
+							nanoContext.Response.Redirect( url );
+							return nanoContext;
+						}
 
-                        foreach ( string defaultDocument in DefaultDocuments )
-                        {
-                            string path = Path.Combine( fullFileSystemPath, defaultDocument );
+						foreach ( string defaultDocument in DefaultDocuments )
+						{
+							string path = Path.Combine( fullFileSystemPath, defaultDocument );
 
-                            if ( IsCaseSensitiveFileSystem )
-                                path = GetPathCaseSensitive( path );
+							if ( IsCaseSensitiveFileSystem )
+								path = GetPathCaseSensitive( path );
 
-                            if ( nanoContext.TryReturnFile( new FileInfo( path ) ) )
-                                return nanoContext;
-                        }
-                    }
-                }
+							if ( nanoContext.TryReturnFile( new FileInfo( path ) ) )
+								return nanoContext;
+						}
+					}
+				}
 
                 if ( ReturnHttp404WhenFileWasNoFound ) return nanoContext.ReturnHttp404NotFound();
 
@@ -2877,7 +2955,7 @@ namespace Nano.Web.Core
                 for (var i = 0; i < filePath.Length; i++)
                 {
                     int c = filePath[i];
-                    
+
                     if (c == '\"' || c == '<' || c == '>' || c == '|' || c == '*' || c == '?' || c < 32)
                         return true;
                 }
@@ -2979,7 +3057,7 @@ namespace Nano.Web.Core
 
                 if ( string.IsNullOrWhiteSpace( nanoContext.Response.ContentType ) )
                     nanoContext.Response.ContentType =  "application/json";
-                
+
                 return nanoContext;
             }
         }
@@ -3259,7 +3337,7 @@ namespace Nano.Web.Core
 
                 if ( string.IsNullOrWhiteSpace( nanoContext.Response.ContentType ) )
                     nanoContext.Response.ContentType = "application/json";
-                
+
                 return nanoContext;
             }
 
