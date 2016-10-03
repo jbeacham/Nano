@@ -1012,6 +1012,7 @@ namespace Nano.Web.Core
             eventHandler.PreInvokeHandlers.Add( context =>
             {
                 context.Response.HeaderParameters.Add( "Access-Control-Allow-Origin", allowedOrigin );
+                context.Response.HeaderParameters.Add( "Access-Control-Allow-Credentials", "true" );
 
                 if ( context.Request.HttpMethod == "OPTIONS" )
                 {
