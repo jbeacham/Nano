@@ -999,20 +999,21 @@ namespace Nano.Web.Core
         /// <summary>Enables CORS ( Cross-origin resource sharing ) requests.</summary>
         /// <param name="nanoConfiguration">The nano configuration.</param>
         /// <param name="allowedOrigin">The allowed origin.</param>
-        public static void EnableCors( this NanoConfiguration nanoConfiguration, string allowedOrigin = "*" )
+        public static void EnableCors( this NanoConfiguration nanoConfiguration, string allowedOrigin = "*", bool allowCredentials = true )
         {
-            nanoConfiguration.GlobalEventHandler.EnableCors( allowedOrigin );
+            nanoConfiguration.GlobalEventHandler.EnableCors( allowedOrigin, allowCredentials );
         }
         
         /// <summary>Enables CORS ( Cross-origin resource sharing ) requests.</summary>
         /// <param name="eventHandler">The event handler.</param>
         /// <param name="allowedOrigin">The allowed origin.</param>
-        public static void EnableCors( this EventHandler eventHandler, string allowedOrigin = "*" )
+        public static void EnableCors( this EventHandler eventHandler, string allowedOrigin = "*", bool allowCredentials = true )
         {
             eventHandler.PreInvokeHandlers.Add( context =>
             {
                 context.Response.HeaderParameters.Add( "Access-Control-Allow-Origin", allowedOrigin );
-                context.Response.HeaderParameters.Add( "Access-Control-Allow-Credentials", "true" );
+                if ( allowCredentials )
+                    context.Response.HeaderParameters.Add( "Access-Control-Allow-Credentials", "true" );
 
                 if ( context.Request.HttpMethod == "OPTIONS" )
                 {
