@@ -1018,9 +1018,7 @@ namespace Nano.Web.Core
                     context.Response.HeaderParameters.Add( "Access-Control-Allow-Credentials", "true" );
 
                     if ( allowedOrigin == "*")
-                    {
                         allowedOrigin = context.Request.Url.SiteBase;
-                    }
                 }
 
                 context.Response.HeaderParameters.Add( "Access-Control-Allow-Origin", allowedOrigin );
